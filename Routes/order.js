@@ -765,7 +765,7 @@ router.post('/orders/bulk',
           
           // TODO: Call MTN API for each number
           // For now, simulate success
-          transaction.status = 'successful';
+          transaction.status = 'pending';
           transaction.completedAt = new Date();
           await transaction.save({ session });
           
