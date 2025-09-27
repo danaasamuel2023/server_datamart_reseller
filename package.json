@@ -1,13 +1,41 @@
+// package.json
 {
+  "name": "ghana-mtn-data-platform",
+  "version": "1.0.0",
+  "description": "MTN Data Reselling Platform API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "build": "echo 'No build step required for Node.js API'",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
   "dependencies": {
+    "express": "^4.18.2",
     "axios": "^1.12.2",
-    "bcryptjs": "^3.0.2",
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.2",
-    "express-rate-limit": "^8.1.0",
-    "express-validator": "^7.2.1",
+    "dotenv": "^16.0.3",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.18.2",
+    "mongoose": "^8.0.3",
     "xlsx": "^0.18.5"
-  }
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "mtn",
+    "data",
+    "reselling",
+    "ghana",
+    "api"
+  ],
+  "author": "Your Name",
+  "license": "ISC"
 }
