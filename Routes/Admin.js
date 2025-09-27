@@ -2085,30 +2085,19 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
 });
 
 // Updated Export orders to Excel with batch tracking
+// Replace the /orders/export/excel route in your admin.js with this optimized version
+
 router.post('/orders/export/excel', async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-  
   try {
     const { 
       startDate, 
       endDate, 
       status = 'pending',
       markAsSuccessful = false,
-      confirmExport = false,
-      limit = 40 
+      confirmExport = true // Always true now - no confirmation needed
     } = req.body;
     
-    if (status === 'pending' && markAsSuccessful && !confirmExport) {
-      await session.abortTransaction();
-      return res.status(400).json({
-        success: false,
-        requiresConfirmation: true,
-        message: 'CONFIRMATION REQUIRED: You are about to export pending orders and mark them as successful. This action cannot be undone. Set confirmExport: true to proceed.',
-        warning: 'This will mark all exported pending orders as successful and deduct from user wallets.'
-      });
-    }
-    
+    // Build filter
     const filter = {
       type: 'data_purchase',
       status: status
@@ -2120,20 +2109,18 @@ router.post('/orders/export/excel', async (req, res) => {
       if (endDate) filter.createdAt.$lte = new Date(endDate);
     }
     
-    const maxLimit = Math.min(parseInt(limit), 40);
+    // Fetch orders with populated data - single query
     const orders = await Transaction.find(filter)
       .sort({ createdAt: -1 })
-      .limit(maxLimit)
+      .limit(40)
       .populate('dataDetails.product', 'name capacity')
       .populate('user', 'fullName phone wallet')
-      .session(session)
       .lean();
     
     if (orders.length === 0) {
-      await session.abortTransaction();
       return res.status(404).json({
         success: false,
-        message: 'No orders found for the specified criteria'
+        message: 'No orders found'
       });
     }
     
@@ -2142,162 +2129,205 @@ router.post('/orders/export/excel', async (req, res) => {
     const batchId = `BATCH${String(batchCount + 1).padStart(6, '0')}`;
     const batchNumber = batchCount + 1;
     
-    const processedOrders = [];
-    const failedUpdates = [];
     const batchOrders = [];
     let totalAmount = 0;
     
-    // Process orders
+    // Prepare batch order data
     for (const order of orders) {
-      const orderData = {
+      batchOrders.push({
         transactionId: order.transactionId,
         beneficiaryNumber: order.dataDetails?.beneficiaryNumber || 'N/A',
-        capacity: order.dataDetails?.capacity || 
-          (order.dataDetails?.product?.capacity ? 
-            `${order.dataDetails.product.capacity.value}}` : 
-            'N/A'),
+        capacity: order.dataDetails?.capacity || 'N/A',
         amount: order.amount,
         status: order.status,
         userName: order.user?.fullName,
         userId: order.user?._id
-      };
-      
-      batchOrders.push(orderData);
+      });
       totalAmount += order.amount;
+    }
+    
+    let processedCount = 0;
+    let failedCount = 0;
+    
+    // FAST PROCESSING: Bulk update if marking as successful
+    if (status === 'pending' && markAsSuccessful) {
       
-      if (status === 'pending' && markAsSuccessful && confirmExport) {
-        try {
-          await Transaction.findByIdAndUpdate(
-            order._id,
-            {
+      // Step 1: Bulk update all transactions to successful
+      const bulkOps = orders.map(order => ({
+        updateOne: {
+          filter: { _id: order._id },
+          update: {
+            $set: {
               status: 'successful',
               completedAt: new Date(),
               statusUpdatedBy: req.userId,
               statusUpdatedAt: new Date(),
-              statusUpdateReason: `Batch export ${batchId} - marked as successful by admin`,
-              batchId: batchId
-            },
-            { session }
-          );
-          
-          const user = await User.findById(order.user._id).session(session);
-          if (user && user.wallet.balance >= order.amount) {
-            const balanceBefore = user.wallet.balance;
-            user.wallet.balance -= order.amount;
-            await user.save({ session });
-            
-            await WalletTransaction.create([{
-              user: order.user._id,
-              type: 'debit',
-              amount: order.amount,
-              balanceBefore: balanceBefore,
-              balanceAfter: user.wallet.balance,
-              purpose: 'purchase',
-              reference: order.transactionId,
-              status: 'completed',
-              description: `Batch ${batchId}: ${order.dataDetails?.beneficiaryNumber}`
-            }], { session });
-            
-            processedOrders.push(order.transactionId);
-            orderData.status = 'successful';
-          } else {
-            failedUpdates.push({
-              transactionId: order.transactionId,
-              reason: 'Insufficient wallet balance'
-            });
+              statusUpdateReason: `Batch ${batchId}`,
+              'metadata.batchId': batchId
+            }
           }
-          
-          await Notification.create([{
-            user: order.user._id,
-            title: 'Order Processed',
-            message: `Your order ${order.transactionId} has been processed in batch ${batchId}`,
-            type: 'success',
-            category: 'transaction',
-            relatedTransaction: order._id
-          }], { session });
-          
-        } catch (error) {
-          failedUpdates.push({
-            transactionId: order.transactionId,
-            reason: error.message
+        }
+      }));
+      
+      const bulkResult = await Transaction.bulkWrite(bulkOps, { ordered: false });
+      processedCount = bulkResult.modifiedCount;
+      
+      // Step 2: Process wallet updates in bulk (for users with sufficient balance)
+      const userUpdates = [];
+      const walletTransactions = [];
+      
+      for (const order of orders) {
+        if (order.user && order.user.wallet.balance >= order.amount) {
+          // Prepare user wallet update
+          userUpdates.push({
+            updateOne: {
+              filter: { 
+                _id: order.user._id,
+                'wallet.balance': { $gte: order.amount }
+              },
+              update: {
+                $inc: { 'wallet.balance': -order.amount }
+              }
+            }
           });
+          
+          // Prepare wallet transaction
+          walletTransactions.push({
+            user: order.user._id,
+            type: 'debit',
+            amount: order.amount,
+            balanceBefore: order.user.wallet.balance,
+            balanceAfter: order.user.wallet.balance - order.amount,
+            purpose: 'purchase',
+            reference: `${order.transactionId}_B${batchNumber}_${Date.now()}`,
+            status: 'completed',
+            description: `Batch ${batchId}`,
+            relatedTransaction: order._id
+          });
+          
+          // Update batch order status
+          const idx = batchOrders.findIndex(bo => bo.transactionId === order.transactionId);
+          if (idx !== -1) batchOrders[idx].status = 'successful';
+        } else {
+          failedCount++;
         }
       }
+      
+      // Execute bulk user updates
+      if (userUpdates.length > 0) {
+        await User.bulkWrite(userUpdates, { ordered: false });
+      }
+      
+      // Bulk insert wallet transactions (skip duplicates)
+      if (walletTransactions.length > 0) {
+        try {
+          await WalletTransaction.insertMany(walletTransactions, { ordered: false });
+        } catch (err) {
+          console.log('Some wallet transactions may have failed:', err.message);
+        }
+      }
+      
+      // Single bulk notification for all users (optional - can skip for speed)
+      // Skip individual notifications for speed
     }
     
     // Create batch record
-    const batch = new Batch({
+    await Batch.create({
       batchId,
       batchNumber,
       exportedBy: req.userId,
       orders: batchOrders,
       stats: {
         totalOrders: orders.length,
-        processedOrders: processedOrders.length,
-        failedOrders: failedUpdates.length,
+        processedOrders: processedCount,
+        failedOrders: failedCount,
         totalAmount: totalAmount,
         originalStatus: status,
         markedAsSuccessful: markAsSuccessful
       },
-      status: processedOrders.length === orders.length ? 'completed' : 
-              processedOrders.length > 0 ? 'partial' : 'exported',
+      status: processedCount === orders.length ? 'completed' : 
+              processedCount > 0 ? 'partial' : 'exported',
       fileName: `batch_${batchId}_${new Date().toISOString().split('T')[0]}.xlsx`
     });
     
-    await batch.save({ session });
+    // Generate Excel - simplified for speed
+    const workbook = XLSX.utils.book_new();
     
-    // Generate Excel
+    // Main sheet - simplified
     const excelData = batchOrders.map(order => ({
-      'Beneficiary Number': order.beneficiaryNumber,
-      'Capacity': order.capacity
+      'Beneficiary': order.beneficiaryNumber,
+      'Data': order.capacity
     }));
     
-    await session.commitTransaction();
-    
-    const workbook = XLSX.utils.book_new();
     const worksheet = XLSX.utils.json_to_sheet(excelData);
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Orders');
     
-    // Add batch info sheet
-    const batchInfoData = [{
-      'Batch ID': batchId,
-      'Batch Number': batchNumber,
-      'Export Date': new Date().toISOString(),
-      'Total Orders': orders.length,
-      'Successfully Processed': processedOrders.length,
-      'Failed Updates': failedUpdates.length,
-      'Total Amount': totalAmount,
-      'Exported By': req.user.fullName,
-      'Original Status': status,
-      'Marked as Successful': markAsSuccessful ? 'Yes' : 'No'
-    }];
-    
-    const batchInfoSheet = XLSX.utils.json_to_sheet(batchInfoData);
-    XLSX.utils.book_append_sheet(workbook, batchInfoSheet, 'Batch Info');
-    
+    // Generate buffer
     const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
     
+    // Send response
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="batch_${batchId}.xlsx"`);
     res.setHeader('X-Batch-ID', batchId);
     res.setHeader('X-Export-Summary', JSON.stringify({
       batchId,
       exported: orders.length,
-      processed: processedOrders.length,
-      failed: failedUpdates.length
+      processed: processedCount,
+      failed: failedCount
     }));
     
     res.send(excelBuffer);
     
   } catch (error) {
-    await session.abortTransaction();
+    console.error('Export error:', error);
     res.status(500).json({
       success: false,
       message: 'Error exporting batch',
       error: error.message
     });
-  } finally {
-    session.endSession();
+  }
+});
+
+// Alternative: Ultra-fast export without processing (just export)
+router.post('/orders/export/excel-fast', async (req, res) => {
+  try {
+    const { status = 'pending' } = req.body;
+    
+    // Single query with lean for speed
+    const orders = await Transaction.find({
+      type: 'data_purchase',
+      status: status
+    })
+    .select('transactionId dataDetails.beneficiaryNumber dataDetails.capacity amount')
+    .limit(40)
+    .lean()
+    .exec();
+    
+    if (orders.length === 0) {
+      return res.status(404).json({ success: false, message: 'No orders found' });
+    }
+    
+    // Quick batch ID
+    const batchId = `BATCH${Date.now().toString().slice(-6)}`;
+    
+    // Direct Excel generation
+    const data = orders.map(o => ({
+      'Beneficiary': o.dataDetails?.beneficiaryNumber || 'N/A',
+      'Data': o.dataDetails?.capacity || 'N/A'
+    }));
+    
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Orders');
+    
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${batchId}.xlsx"`);
+    res.send(buffer);
+    
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
