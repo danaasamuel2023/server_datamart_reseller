@@ -17,6 +17,7 @@ const dataOrderRoutes = require('./Routes/order.js');
 const adminManagement = require('./Routes/Admin.js');
 const api = require('./Routes/api.js');
 const UserProfile = require('./Routes/user.js');
+const User_action = require('./Routes/Useractions.js');
 
 // Uncomment these as you need them
 // const SystemSettings = require('./routes/settings/setting.js');
@@ -62,6 +63,7 @@ const setupRoutes = () => {
   app.use('/api/admin', adminManagement);
   app.use('/api', api);
   app.use('/api/user', UserProfile);
+  app.use('/api/useractions', User_action);
   
   // Uncomment these as you need them
   // app.use('/api/admin/settings', SystemSettings);
