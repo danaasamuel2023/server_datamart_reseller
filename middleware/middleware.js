@@ -367,7 +367,7 @@ const validators = {
 };
 
 // =============================================
-// 5. WALLET MIDDLEWARE
+// 5. WALLET MIDDLEWARE - UPDATED FOR MANUAL PROCESSING
 // =============================================
 
 const walletMiddleware = {
@@ -404,22 +404,49 @@ const walletMiddleware = {
     }
   },
 
-  // Lock wallet during transaction (prevent double spending)
+  // UPDATED: Allow orders even with pending transactions (manual processing)
   lockWallet: async (req, res, next) => {
     try {
       const userId = req.userId;
       
-      // Check if user has pending transaction
-      const pendingTx = await Transaction.findOne({
+      // NO LONGER CHECK FOR PENDING TRANSACTIONS
+      // Since orders are processed manually and money is deducted immediately,
+      // users can place multiple orders as long as they have balance
+      
+      // Optional: Check if wallet is locked for security reasons
+      const user = await User.findById(userId);
+      if (user?.wallet?.isLocked) {
+        return res.status(403).json({
+          success: false,
+          message: 'Wallet is temporarily locked. Please contact support.'
+        });
+      }
+      
+      // Optional: Rate limit to prevent rapid order spamming
+      const recentOrderCount = await Transaction.countDocuments({
         user: userId,
-        status: 'pending',
-        createdAt: { $gte: new Date(Date.now() - 60000) } // Within last minute
+        type: 'data_purchase',
+        createdAt: { $gte: new Date(Date.now() - 60000) } // Last minute
+      });
+      
+      if (recentOrderCount >= 10) {
+        return res.status(429).json({
+          success: false,
+          message: 'Too many orders placed recently. Please wait a moment before placing another order.'
+        });
+      }
+
+      // Optional: Check for processing status (if you use this status when actively fulfilling)
+      const processingTx = await Transaction.findOne({
+        user: userId,
+        status: 'processing', // Only if you mark orders as 'processing' when actively fulfilling
+        createdAt: { $gte: new Date(Date.now() - 300000) } // Within last 5 minutes
       });
 
-      if (pendingTx) {
+      if (processingTx) {
         return res.status(409).json({
           success: false,
-          message: 'Please wait for your pending transaction to complete'
+          message: 'We are currently processing your order. Please wait a moment.'
         });
       }
 

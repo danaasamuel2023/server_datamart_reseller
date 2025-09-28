@@ -196,6 +196,7 @@ productSchema.index({ category: 1 });
 // 3. TRANSACTION SCHEMA
 // =============================================
 
+// Updated Transaction Schema with proper metadata structure
 const transactionSchema = new mongoose.Schema({
   // Transaction ID
   transactionId: {
@@ -222,7 +223,7 @@ const transactionSchema = new mongoose.Schema({
   dataDetails: {
     product: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'Product_reseller'  // Fixed reference
+      ref: 'Product_reseller'
     },
     beneficiaryNumber: {
       type: String,
@@ -251,10 +252,10 @@ const transactionSchema = new mongoose.Schema({
   balanceBefore: Number,
   balanceAfter: Number,
   
-  // Status
+  // Status - Added 'sent' to enum
   status: {
     type: String,
-    enum: ['pending', 'successful', 'failed'],
+    enum: ['pending', 'sent', 'processing', 'successful', 'failed', 'reversed'],
     default: 'pending'
   },
   
@@ -272,14 +273,39 @@ const transactionSchema = new mongoose.Schema({
     sparse: true
   },
   
-  // Metadata for bulk orders
+  // FIXED: Properly structured metadata for export tracking
   metadata: {
+    exportId: String,
+    batchId: String,
     bulkReference: String,
+    estimatedCompletion: Date,
+    processingMinutes: Number,
     note: String
   },
   
+  // Export tracking fields
+  exportedAt: Date,
+  
+  // Status update tracking
+  statusUpdatedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
+  },
+  statusUpdatedAt: Date,
+  statusUpdateReason: String,
+  
   // Error tracking
   failureReason: String,
+  
+  // Reversal tracking
+  reversedAt: Date,
+  reversedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
+  },
+  
+  // Notes
+  notes: String,
   
   // Timestamps
   processedAt: Date,
@@ -288,11 +314,15 @@ const transactionSchema = new mongoose.Schema({
   timestamps: true
 });
 
+// Indexes for better query performance
 transactionSchema.index({ transactionId: 1 });
 transactionSchema.index({ user: 1, createdAt: -1 });
 transactionSchema.index({ status: 1 });
 transactionSchema.index({ type: 1 });
 transactionSchema.index({ 'dataDetails.beneficiaryNumber': 1 });
+transactionSchema.index({ 'metadata.exportId': 1 }); // Important for export queries
+transactionSchema.index({ 'metadata.batchId': 1 });
+transactionSchema.index({ status: 1, 'metadata.exportId': 1 }); // Compound index for auto-completion
 
 // Auto-generate transaction ID
 transactionSchema.pre('save', function(next) {

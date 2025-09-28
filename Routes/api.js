@@ -1,6 +1,7 @@
 // =============================================
 // EXTERNAL API ROUTES - GHANA MTN DATA PLATFORM
 // For Third-Party Integration (Single & Bulk Purchase)
+// Updated: Both endpoints now use capacity + product_name
 // =============================================
 
 const express = require('express');
@@ -123,6 +124,82 @@ const sendWebhook = async (user, event, data) => {
   } catch (error) {
     console.error('Webhook error:', error.message);
   }
+};
+
+// =============================================
+// HELPER FUNCTION: Parse and Validate Product
+// =============================================
+
+const findProductByCapacityAndName = async (capacity, productName) => {
+  // Parse capacity input (e.g., "2GB" -> {value: 2, unit: "GB"})
+  const capacityRegex = /^(\d+(?:\.\d+)?)(MB|GB)$/i;
+  const capacityMatch = capacity.toUpperCase().match(capacityRegex);
+  
+  if (!capacityMatch) {
+    return {
+      error: true,
+      code: 'INVALID_CAPACITY_FORMAT',
+      message: 'Invalid capacity format',
+      details: {
+        format: 'Valid formats: 500MB, 1GB, 2.5GB',
+        provided: capacity
+      }
+    };
+  }
+  
+  const capacityValue = parseFloat(capacityMatch[1]);
+  const capacityUnit = capacityMatch[2];
+  
+  // Find product by name and capacity
+  const product = await Product.findOne({
+    name: new RegExp(productName, 'i'), // Case-insensitive search
+    'capacity.value': capacityValue,
+    'capacity.unit': capacityUnit,
+    status: 'active'
+  });
+  
+  if (!product) {
+    // Try to find products with matching capacity to suggest alternatives
+    const alternativeProducts = await Product.find({
+      'capacity.value': capacityValue,
+      'capacity.unit': capacityUnit,
+      status: 'active'
+    }).select('name productCode');
+    
+    if (alternativeProducts.length > 0) {
+      return {
+        error: true,
+        code: 'PRODUCT_NOT_FOUND',
+        message: 'Product not found with specified name and capacity',
+        details: {
+          requested: {
+            name: productName,
+            capacity: capacity
+          },
+          available_alternatives: alternativeProducts.map(p => ({
+            name: p.name,
+            product_code: p.productCode
+          }))
+        }
+      };
+    } else {
+      return {
+        error: true,
+        code: 'CAPACITY_NOT_AVAILABLE',
+        message: 'No products available with specified capacity',
+        details: {
+          requested_capacity: capacity
+        }
+      };
+    }
+  }
+  
+  return {
+    error: false,
+    product: product,
+    capacityValue: capacityValue,
+    capacityUnit: capacityUnit
+  };
 };
 
 // =============================================
@@ -324,6 +401,102 @@ router.get('/v1/products/:productCode', async (req, res) => {
   }
 });
 
+// Get available capacities
+router.get('/v1/capacities', async (req, res) => {
+  try {
+    const userRole = req.userRole;
+    
+    // Aggregate products by capacity
+    const products = await Product.aggregate([
+      { $match: { status: 'active' } },
+      {
+        $group: {
+          _id: {
+            value: '$capacity.value',
+            unit: '$capacity.unit'
+          },
+          products: {
+            $push: {
+              name: '$name',
+              productCode: '$productCode',
+              validity: '$validity'
+            }
+          }
+        }
+      },
+      {
+        $project: {
+          _id: 0,
+          capacity: {
+            $concat: [
+              { $toString: '$_id.value' },
+              '$_id.unit'
+            ]
+          },
+          capacity_value: '$_id.value',
+          capacity_unit: '$_id.unit',
+          available_products: '$products'
+        }
+      },
+      { $sort: { capacity_value: 1 } }
+    ]);
+    
+    // Get pricing for each capacity's products
+    const capacitiesWithPricing = await Promise.all(
+      products.map(async (capacityGroup) => {
+        const productsWithPricing = await Promise.all(
+          capacityGroup.available_products.map(async (prod) => {
+            const product = await Product.findOne({ productCode: prod.productCode });
+            const pricing = await PriceSetting.findOne({
+              product: product._id,
+              isActive: true
+            });
+            
+            if (!pricing) return null;
+            
+            let price;
+            switch (userRole) {
+              case 'supplier':
+                price = pricing.supplierPrice;
+                break;
+              case 'dealer':
+                price = pricing.dealerPrice;
+                break;
+              case 'agent':
+                price = pricing.agentPrice;
+                break;
+              default:
+                price = pricing.agentPrice;
+            }
+            
+            return {
+              name: prod.name,
+              validity: `${prod.validity.value} ${prod.validity.unit}`,
+              price: price
+            };
+          })
+        );
+        
+        return {
+          capacity: capacityGroup.capacity,
+          products: productsWithPricing.filter(p => p !== null)
+        };
+      })
+    );
+    
+    return apiResponse.success(res, 'Available capacities retrieved', {
+      capacities: capacitiesWithPricing,
+      total: capacitiesWithPricing.length,
+      price_tier: req.userRole
+    });
+  } catch (error) {
+    return apiResponse.error(res, 'Error fetching capacities', {
+      code: 'CAPACITY_ERROR',
+      details: error.message
+    }, 500);
+  }
+});
+
 // =============================================
 // 3. SINGLE PURCHASE API
 // =============================================
@@ -335,8 +508,8 @@ router.post('/v1/purchase', async (req, res) => {
   
   try {
     const {
-      capacity,           // e.g., "2GB", "500MB", "1GB"
-      product_name,       // e.g., "Daily Bundle", "Weekly Bundle"
+      capacity,
+      product_name,
       beneficiary_number,
       reference,
       callback_url
@@ -354,7 +527,8 @@ router.post('/v1/purchase', async (req, res) => {
     if (!product_name) {
       await session.abortTransaction();
       return apiResponse.error(res, 'Product name is required', {
-        code: 'MISSING_PRODUCT_NAME'
+        code: 'MISSING_PRODUCT_NAME',
+        available: 'YELLOW'
       });
     }
     
@@ -374,59 +548,18 @@ router.post('/v1/purchase', async (req, res) => {
       });
     }
     
-    // Parse capacity input (e.g., "2GB" -> {value: 2, unit: "GB"})
-    const capacityRegex = /^(\d+(?:\.\d+)?)(MB|GB)$/i;
-    const capacityMatch = capacity.toUpperCase().match(capacityRegex);
+    // Find product using helper function
+    const productResult = await findProductByCapacityAndName(capacity, product_name);
     
-    if (!capacityMatch) {
+    if (productResult.error) {
       await session.abortTransaction();
-      return apiResponse.error(res, 'Invalid capacity format', {
-        code: 'INVALID_CAPACITY_FORMAT',
-        format: 'Valid formats: 500MB, 1GB, 2.5GB',
-        provided: capacity
-      });
+      return apiResponse.error(res, productResult.message, {
+        code: productResult.code,
+        ...productResult.details
+      }, 404);
     }
     
-    const capacityValue = parseFloat(capacityMatch[1]);
-    const capacityUnit = capacityMatch[2];
-    
-    // Find product by name and capacity
-    const product = await Product.findOne({
-      name: new RegExp(product_name, 'i'), // Case-insensitive search
-      'capacity.value': capacityValue,
-      'capacity.unit': capacityUnit,
-      status: 'active'
-    });
-    
-    if (!product) {
-      // Try to find products with matching capacity to suggest alternatives
-      const alternativeProducts = await Product.find({
-        'capacity.value': capacityValue,
-        'capacity.unit': capacityUnit,
-        status: 'active'
-      }).select('name productCode');
-      
-      if (alternativeProducts.length > 0) {
-        await session.abortTransaction();
-        return apiResponse.error(res, 'Product not found with specified name and capacity', {
-          code: 'PRODUCT_NOT_FOUND',
-          requested: {
-            name: product_name,
-            capacity: capacity
-          },
-          available_alternatives: alternativeProducts.map(p => ({
-            name: p.name,
-            product_code: p.productCode
-          }))
-        }, 404);
-      } else {
-        await session.abortTransaction();
-        return apiResponse.error(res, 'No products available with specified capacity', {
-          code: 'CAPACITY_NOT_AVAILABLE',
-          requested_capacity: capacity
-        }, 404);
-      }
-    }
+    const product = productResult.product;
     
     // Get pricing based on user role
     const pricing = await PriceSetting.findOne({
@@ -535,93 +668,46 @@ router.post('/v1/purchase', async (req, res) => {
     }], { session });
     
     // TODO: Call MTN API here
-    // Simulate MTN API call
-    const mtnApiSuccess = Math.random() > 0.1; // 90% success rate for testing
+    // For now, transaction stays as pending for manual processing
     
-    if (mtnApiSuccess) {
-      // Update transaction status
-      transaction.status = 'successful';
-      transaction.completedAt = new Date();
-      transaction.apiResponse = {
-        provider: 'MTN',
-        requestId: 'MTN' + Date.now(),
-        responseCode: '200',
-        responseMessage: 'Data bundle activated successfully'
-      };
-      await transaction.save({ session });
-      
-      // Update product stats
-      product.stats.totalSold += 1;
-      product.stats.totalRevenue += amount;
-      await product.save({ session });
-      
-      await session.commitTransaction();
-      
-      // Send webhook notification
-      sendWebhook(user, 'purchase.successful', {
+    await session.commitTransaction();
+    
+    // Send webhook notification
+    sendWebhook(user, 'purchase.pending', {
+      reference: transactionRef,
+      product: product.name,
+      capacity: capacity,
+      beneficiary: beneficiary_number,
+      amount: amount,
+      status: 'pending'
+    });
+    
+    // Send callback if provided
+    if (callback_url) {
+      axios.post(callback_url, {
         reference: transactionRef,
-        product: product.name,
-        capacity: capacity,
-        beneficiary: beneficiary_number,
-        amount: amount,
-        status: 'successful'
-      });
-      
-      // Send callback if provided
-      if (callback_url) {
-        axios.post(callback_url, {
-          reference: transactionRef,
-          status: 'successful',
-          message: 'Data purchase successful'
-        }).catch(console.error);
-      }
-      
-      return apiResponse.success(res, 'Purchase successful', {
-        reference: transactionRef,
-        transaction_id: transaction._id,
-        product: {
-          name: product.name,
-          capacity: capacity,
-          validity: `${product.validity.value} ${product.validity.unit}`,
-          product_code: product.productCode // Include for reference
-        },
-        beneficiary: beneficiary_number,
-        amount: amount,
-        price_tier: req.userRole, // Show which pricing tier was used
-        currency: 'GHS',
-        status: 'successful',
-        completed_at: transaction.completedAt,
-        balance_after: user.wallet.balance
-      }, 201);
-    } else {
-      // Transaction failed - refund
-      user.wallet.balance += amount;
-      await user.save({ session });
-      
-      transaction.status = 'failed';
-      transaction.failureReason = 'MTN API error';
-      await transaction.save({ session });
-      
-      await session.commitTransaction();
-      
-      // Send webhook notification
-      sendWebhook(user, 'purchase.failed', {
-        reference: transactionRef,
-        product: product.name,
-        capacity: capacity,
-        beneficiary: beneficiary_number,
-        amount: amount,
-        status: 'failed',
-        reason: 'Provider error'
-      });
-      
-      return apiResponse.error(res, 'Purchase failed', {
-        code: 'PURCHASE_FAILED',
-        reference: transactionRef,
-        reason: 'Provider error',
-        refunded: true
-      }, 500);
+        status: 'pending',
+        message: 'Data purchase pending manual processing'
+      }).catch(console.error);
     }
+    
+    return apiResponse.success(res, 'Purchase successful - pending manual processing', {
+      reference: transactionRef,
+      transaction_id: transaction._id,
+      product: {
+        name: product.name,
+        capacity: capacity,
+        validity: `${product.validity.value} ${product.validity.unit}`,
+        product_code: product.productCode
+      },
+      beneficiary: beneficiary_number,
+      amount: amount,
+      price_tier: req.userRole,
+      currency: 'GHS',
+      status: 'pending',
+      balance_after: user.wallet.balance
+    }, 201);
+    
   } catch (error) {
     await session.abortTransaction();
     return apiResponse.error(res, 'Error processing purchase', {
@@ -634,110 +720,10 @@ router.post('/v1/purchase', async (req, res) => {
 });
 
 // =============================================
-// HELPER ENDPOINT: List Available Capacities
+// 4. BULK PURCHASE API - UPDATED
 // =============================================
 
-// Get available capacities and their products
-router.get('/v1/capacities', async (req, res) => {
-  try {
-    const userRole = req.userRole;
-    
-    // Aggregate products by capacity
-    const products = await Product.aggregate([
-      { $match: { status: 'active' } },
-      {
-        $group: {
-          _id: {
-            value: '$capacity.value',
-            unit: '$capacity.unit'
-          },
-          products: {
-            $push: {
-              name: '$name',
-              productCode: '$productCode',
-              validity: '$validity'
-            }
-          }
-        }
-      },
-      {
-        $project: {
-          _id: 0,
-          capacity: {
-            $concat: [
-              { $toString: '$_id.value' },
-              '$_id.unit'
-            ]
-          },
-          capacity_value: '$_id.value',
-          capacity_unit: '$_id.unit',
-          available_products: '$products'
-        }
-      },
-      { $sort: { capacity_value: 1 } }
-    ]);
-    
-    // Get pricing for each capacity's products
-    const capacitiesWithPricing = await Promise.all(
-      products.map(async (capacityGroup) => {
-        const productsWithPricing = await Promise.all(
-          capacityGroup.available_products.map(async (prod) => {
-            const product = await Product.findOne({ productCode: prod.productCode });
-            const pricing = await PriceSetting.findOne({
-              product: product._id,
-              isActive: true
-            });
-            
-            if (!pricing) return null;
-            
-            let price;
-            switch (userRole) {
-              case 'supplier':
-                price = pricing.supplierPrice;
-                break;
-              case 'dealer':
-                price = pricing.dealerPrice;
-                break;
-              case 'agent':
-                price = pricing.agentPrice;
-                break;
-              default:
-                price = pricing.agentPrice;
-            }
-            
-            return {
-              name: prod.name,
-              validity: `${prod.validity.value} ${prod.validity.unit}`,
-              price: price
-            };
-          })
-        );
-        
-        return {
-          capacity: capacityGroup.capacity,
-          products: productsWithPricing.filter(p => p !== null)
-        };
-      })
-    );
-    
-    return apiResponse.success(res, 'Available capacities retrieved', {
-      capacities: capacitiesWithPricing,
-      total: capacitiesWithPricing.length,
-      price_tier: req.userRole
-    });
-  } catch (error) {
-    return apiResponse.error(res, 'Error fetching capacities', {
-      code: 'CAPACITY_ERROR',
-      details: error.message
-    }, 500);
-  }
-});
-
-// =============================================
-// 4. BULK PURCHASE API
-// =============================================
-
-// Bulk purchase data bundles
+// Bulk purchase data bundles - now uses capacity and product_name
 router.post('/v1/purchase/bulk', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -778,26 +764,38 @@ router.post('/v1/purchase/bulk', async (req, res) => {
         });
       }
       
-      // Validate product code is provided
-      if (!order.product_code) {
+      // Validate capacity is provided
+      if (!order.capacity) {
         await session.abortTransaction();
-        return apiResponse.error(res, `Missing product code in order ${i + 1}`, {
-          code: 'MISSING_PRODUCT_CODE',
+        return apiResponse.error(res, `Missing capacity in order ${i + 1}`, {
+          code: 'MISSING_CAPACITY',
           order_index: i
         });
       }
       
-      // Get product by code
-      const product = await Product.findOne({ productCode: order.product_code.toUpperCase() });
-      
-      if (!product || product.status !== 'active') {
+      // Validate product_name is provided
+      if (!order.product_name) {
         await session.abortTransaction();
-        return apiResponse.error(res, `Product unavailable in order ${i + 1}`, {
-          code: 'PRODUCT_UNAVAILABLE',
+        return apiResponse.error(res, `Missing product name in order ${i + 1}`, {
+          code: 'MISSING_PRODUCT_NAME',
           order_index: i,
-          product_code: order.product_code
+          available: 'YELLOW'
         });
       }
+      
+      // Find product using helper function
+      const productResult = await findProductByCapacityAndName(order.capacity, order.product_name);
+      
+      if (productResult.error) {
+        await session.abortTransaction();
+        return apiResponse.error(res, `Product unavailable in order ${i + 1}: ${productResult.message}`, {
+          code: productResult.code,
+          order_index: i,
+          ...productResult.details
+        });
+      }
+      
+      const product = productResult.product;
       
       // Get pricing
       const pricing = await PriceSetting.findOne({
@@ -839,7 +837,9 @@ router.post('/v1/purchase/bulk', async (req, res) => {
         quantity: quantity,
         beneficiaryNumber: order.beneficiary_number,
         amount: orderAmount,
-        reference: order.reference
+        reference: order.reference,
+        requestedCapacity: order.capacity,
+        requestedProductName: order.product_name
       });
     }
     
@@ -882,57 +882,39 @@ router.post('/v1/purchase/bulk', async (req, res) => {
             quantity: orderDetail.quantity
           },
           amount: orderDetail.amount,
-          status: 'pending',
+          status: 'pending', // Manual processing
           reference: orderRef,
           paymentMethod: 'wallet',
           channel: 'api',
           metadata: {
             bulkReference: bulkReference,
-            apiKey: req.header('X-API-Key')
+            apiKey: req.header('X-API-Key'),
+            requestedCapacity: orderDetail.requestedCapacity,
+            requestedProductName: orderDetail.requestedProductName
           }
         });
         
         await transaction.save({ session });
         
-        // TODO: Call MTN API
-        // Simulate success
-        const mtnApiSuccess = Math.random() > 0.1;
+        // Update product stats
+        orderDetail.product.stats.totalSold += orderDetail.quantity;
+        orderDetail.product.stats.totalRevenue += orderDetail.amount;
+        await orderDetail.product.save({ session });
         
-        if (mtnApiSuccess) {
-          transaction.status = 'successful';
-          transaction.completedAt = new Date();
-          await transaction.save({ session });
-          
-          // Update product stats
-          orderDetail.product.stats.totalSold += orderDetail.quantity;
-          orderDetail.product.stats.totalRevenue += orderDetail.amount;
-          await orderDetail.product.save({ session });
-          
-          processedOrders.push({
-            reference: orderRef,
-            product_code: orderDetail.product.productCode,
-            product_name: orderDetail.product.name,
-            beneficiary: orderDetail.beneficiaryNumber,
-            quantity: orderDetail.quantity,
-            amount: orderDetail.amount,
-            status: 'successful'
-          });
-        } else {
-          transaction.status = 'failed';
-          transaction.failureReason = 'Provider error';
-          await transaction.save({ session });
-          
-          failedOrders.push({
-            reference: orderRef,
-            product_code: orderDetail.product.productCode,
-            beneficiary: orderDetail.beneficiaryNumber,
-            error: 'Provider error',
-            status: 'failed'
-          });
-        }
+        processedOrders.push({
+          reference: orderRef,
+          product_name: orderDetail.product.name,
+          capacity: orderDetail.requestedCapacity,
+          beneficiary: orderDetail.beneficiaryNumber,
+          quantity: orderDetail.quantity,
+          amount: orderDetail.amount,
+          status: 'pending'
+        });
+        
       } catch (error) {
         failedOrders.push({
-          product_code: orderDetail.product.productCode,
+          product_name: orderDetail.requestedProductName,
+          capacity: orderDetail.requestedCapacity,
           beneficiary: orderDetail.beneficiaryNumber,
           error: error.message,
           status: 'failed'
@@ -953,27 +935,6 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       description: `Bulk purchase: ${orders.length} orders`
     }], { session });
     
-    // Calculate refund for failed orders
-    const failedAmount = failedOrders.reduce((sum, order) => {
-      const failed = validatedOrders.find(o => o.beneficiaryNumber === order.beneficiary);
-      return sum + (failed?.amount || 0);
-    }, 0);
-    
-    if (failedAmount > 0) {
-      user.wallet.balance += failedAmount;
-      await user.save({ session });
-      
-      await WalletTransaction.create([{
-        user: req.userId,
-        type: 'credit',
-        amount: failedAmount,
-        purpose: 'refund',
-        reference: 'REFUND_' + bulkReference,
-        status: 'completed',
-        description: `Refund for ${failedOrders.length} failed orders`
-      }], { session });
-    }
-    
     await session.commitTransaction();
     
     // Send webhook notification
@@ -982,8 +943,7 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       total_orders: orders.length,
       successful_orders: processedOrders.length,
       failed_orders: failedOrders.length,
-      total_amount: totalAmount,
-      refunded_amount: failedAmount
+      total_amount: totalAmount
     });
     
     // Send callback if provided
@@ -999,15 +959,13 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       }).catch(console.error);
     }
     
-    return apiResponse.success(res, 'Bulk purchase processed', {
+    return apiResponse.success(res, 'Bulk purchase processed - pending manual processing', {
       bulk_reference: bulkReference,
       summary: {
         total_orders: orders.length,
         successful_count: processedOrders.length,
         failed_count: failedOrders.length,
-        total_amount: totalAmount,
-        refunded_amount: failedAmount,
-        final_charge: totalAmount - failedAmount
+        total_amount: totalAmount
       },
       successful_orders: processedOrders,
       failed_orders: failedOrders,
@@ -1054,7 +1012,6 @@ router.get('/v1/transactions/:reference', async (req, res) => {
       transaction_id: transaction._id,
       status: transaction.status,
       product: {
-        code: transaction.dataDetails.product?.productCode,
         name: transaction.dataDetails.product?.name,
         capacity: transaction.dataDetails.capacity
       },
@@ -1100,7 +1057,7 @@ router.get('/v1/transactions', async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(parseInt(limit))
       .skip((parseInt(page) - 1) * parseInt(limit))
-      .populate('dataDetails.product', 'name productCode')
+      .populate('dataDetails.product', 'name')
       .lean();
     
     const total = await Transaction.countDocuments(filter);
@@ -1108,8 +1065,8 @@ router.get('/v1/transactions', async (req, res) => {
     const formattedTransactions = transactions.map(tx => ({
       reference: tx.reference,
       transaction_id: tx._id,
-      product_code: tx.dataDetails.product?.productCode,
       product_name: tx.dataDetails.product?.name,
+      capacity: tx.metadata?.requestedCapacity || tx.dataDetails.capacity,
       beneficiary: tx.dataDetails.beneficiaryNumber,
       amount: tx.amount,
       status: tx.status,
@@ -1319,7 +1276,7 @@ router.get('/v1/statistics', async (req, res) => {
 // ERROR HANDLING
 // =============================================
 
-// 404 handler for undefined routes - FIXED: removed wildcard
+// 404 handler for undefined routes
 router.use((req, res) => {
   return apiResponse.error(res, 'API endpoint not found', {
     code: 'ENDPOINT_NOT_FOUND',

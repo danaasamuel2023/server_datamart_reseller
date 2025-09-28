@@ -1,5 +1,6 @@
 // =============================================
-// ADMIN API ROUTES - GHANA MTN DATA PLATFORM
+// COMPLETE ADMIN API ROUTES - GHANA MTN DATA PLATFORM
+// With Integrated Export Settings & System Status
 // =============================================
 
 const express = require('express');
@@ -7,9 +8,10 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const XLSX = require('xlsx'); // npm install xlsx
+const XLSX = require('xlsx');
+const cron = require('node-cron');
 
-// Import models
+// Import all models including new export schemas
 const {
   User,
   Product,
@@ -19,9 +21,15 @@ const {
   SystemSetting,
   ApiLog,
   Notification,
-    Batch  // <- This was missing
-
+  Batch,
 } = require('../schema/schema');
+
+const { 
+  ExportSettings,
+  ExportHistory,
+  SystemStatus,
+  ExportQueue 
+} = require('../EXPORTSchema/schema');
 
 // Import middleware
 const {
@@ -34,6 +42,331 @@ const {
 // All admin routes require authentication and admin role
 router.use(auth.verifyToken);
 router.use(role.adminOnly);
+
+// =============================================
+// HELPER VARIABLES AND FUNCTIONS (DECLARED ONCE)
+// =============================================
+
+// Store scheduled jobs in memory - DECLARED ONLY ONCE
+const scheduledJobs = new Map();
+
+// Helper function to schedule auto-completion - SINGLE CORRECT VERSION
+function scheduleAutoCompletion(exportId, minutes, settings) {
+  try {
+    const delay = minutes * 60 * 1000; // Convert minutes to milliseconds
+    
+    const timeout = setTimeout(async () => {
+      try {
+        await completeExport(exportId, settings);
+        scheduledJobs.delete(exportId);
+      } catch (error) {
+        console.error(`Error in auto-completion for export ${exportId}:`, error);
+        scheduledJobs.delete(exportId);
+      }
+    }, delay);
+    
+    scheduledJobs.set(exportId, timeout);
+    console.log(`✅ Scheduled auto-completion for export ${exportId} after ${minutes} minutes`);
+    console.log(`   Orders will be updated from 'sent' to 'successful' at ${new Date(Date.now() + delay).toLocaleString()}`);
+  } catch (error) {
+    console.error(`Error scheduling auto-completion for export ${exportId}:`, error);
+  }
+}
+
+// Helper function to complete an export - SINGLE VERSION
+async function completeExport(exportId, settings) {
+  const session = await mongoose.startSession();
+  let transactionCommitted = false;
+  
+  try {
+    session.startTransaction();
+    
+    const orders = await Transaction.find({ 
+      'metadata.exportId': exportId,
+      status: 'sent'
+    }).session(session);
+    
+    if (orders.length === 0) {
+      console.log(`No orders to complete for export ${exportId}`);
+      await session.abortTransaction();
+      session.endSession();
+      return;
+    }
+    
+    const successRate = (settings?.autoComplete?.successRate || 95) / 100;
+    let successCount = 0;
+    let failCount = 0;
+    
+    const bulkOps = [];
+    const userNotifications = new Map();
+    
+    for (const order of orders) {
+      const isSuccess = Math.random() < successRate;
+      
+      if (isSuccess) {
+        successCount++;
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: order._id },
+            update: {
+              $set: {
+                status: 'successful',
+                completedAt: new Date(),
+                processedAt: new Date()
+              }
+            }
+          }
+        });
+        
+        if (!userNotifications.has(order.user.toString())) {
+          userNotifications.set(order.user.toString(), { success: 0, failed: 0 });
+        }
+        userNotifications.get(order.user.toString()).success++;
+        
+      } else {
+        failCount++;
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: order._id },
+            update: {
+              $set: {
+                status: 'failed',
+                failureReason: 'Processing failed at MTN gateway',
+                processedAt: new Date()
+              }
+            }
+          }
+        });
+        
+        if (!userNotifications.has(order.user.toString())) {
+          userNotifications.set(order.user.toString(), { success: 0, failed: 0 });
+        }
+        userNotifications.get(order.user.toString()).failed++;
+        
+        // Handle refund for failed orders
+        const user = await User.findById(order.user).session(session);
+        if (user) {
+          const balanceBefore = user.wallet.balance;
+          user.wallet.balance += order.amount;
+          await user.save({ session });
+          
+          await WalletTransaction.create([{
+            user: order.user,
+            type: 'credit',
+            amount: order.amount,
+            balanceBefore: balanceBefore,
+            balanceAfter: user.wallet.balance,
+            purpose: 'refund',
+            reference: 'REF' + Date.now() + Math.random().toString(36).substr(2, 9),
+            status: 'completed',
+            description: `Refund for failed data purchase ${order.transactionId}`,
+            relatedTransaction: order._id
+          }], { session });
+        }
+      }
+    }
+    
+    if (bulkOps.length > 0) {
+      await Transaction.bulkWrite(bulkOps, { session });
+    }
+    
+    await ExportHistory.findOneAndUpdate(
+      { exportId },
+      {
+        $set: {
+          'status.current': 'completed',
+          'status.successCount': successCount,
+          'status.failedCount': failCount,
+          'timestamps.completedAt': new Date()
+        }
+      },
+      { session }
+    );
+    
+    await SystemStatus.findOneAndUpdate(
+      { _id: 'current_status' },
+      {
+        $set: {
+          'lastExport.status': 'completed',
+          'lastExport.completedAt': new Date(),
+          'lastExport.successCount': successCount,
+          'lastExport.failedCount': failCount,
+          'currentProcessing.isProcessing': false,
+          'currentProcessing.activeExports': []
+        }
+      },
+      { session }
+    );
+    
+    // Update batch record
+    await Batch.findOneAndUpdate(
+      { batchId: { $regex: exportId } },
+      {
+        $set: {
+          'stats.processedOrders': successCount,
+          'stats.failedOrders': failCount,
+          'status': 'completed',
+          'processingStatus': 'completed'
+        }
+      },
+      { session }
+    );
+    
+    const notifications = Array.from(userNotifications.entries()).map(([userId, stats]) => ({
+      user: userId,
+      title: 'Orders Completed',
+      message: `${stats.success} orders completed successfully${stats.failed > 0 ? `, ${stats.failed} failed` : ''}`,
+      type: stats.success > 0 ? 'success' : 'error',
+      category: 'transaction',
+      metadata: {
+        exportId,
+        successCount: stats.success,
+        failedCount: stats.failed
+      }
+    }));
+    
+    if (notifications.length > 0) {
+      await Notification.insertMany(notifications, { session });
+    }
+    
+    await session.commitTransaction();
+    transactionCommitted = true;
+    
+    console.log(`✅ Export ${exportId} completed: ${successCount} success, ${failCount} failed`);
+    
+  } catch (error) {
+    if (!transactionCommitted) {
+      try {
+        await session.abortTransaction();
+      } catch (abortError) {
+        console.error('Error aborting transaction in completeExport:', abortError);
+      }
+    }
+    console.error(`Error completing export ${exportId}:`, error);
+  } finally {
+    session.endSession();
+  }
+}
+
+// =============================================
+// INITIALIZATION
+// =============================================
+
+// Initialize system status on server start
+const initializeSystemStatus = async () => {
+  try {
+    await SystemStatus.findOneAndUpdate(
+      { _id: 'current_status' },
+      { 
+        $setOnInsert: {
+          systemHealth: { 
+            status: 'healthy',
+            lastCheckedAt: new Date()
+          },
+          currentProcessing: { 
+            isProcessing: false,
+            activeExports: [],
+            queuedExports: 0
+          },
+          statistics: {
+            today: {
+              totalExports: 0,
+              totalOrders: 0,
+              successRate: 100,
+              lastUpdated: new Date()
+            }
+          }
+        }
+      },
+      { upsert: true }
+    );
+    console.log('✅ System status initialized');
+  } catch (error) {
+    console.error('❌ Error initializing system status:', error);
+  }
+};
+
+// Initialize default export settings
+const initializeDefaultSettings = async () => {
+  try {
+    const existingSettings = await ExportSettings.findOne({ settingName: 'default' });
+    
+    if (!existingSettings) {
+      const defaultSettings = new ExportSettings({
+        settingName: 'default',
+        isActive: true,
+        createdBy: null, // System created
+        timeSettings: {
+          phases: {
+            initial: {
+              duration: 5,
+              unit: 'minutes',
+              message: 'Orders received and being prepared for processing...'
+            },
+            processing: {
+              duration: 15,
+              unit: 'minutes',
+              message: 'Orders are being processed by MTN system...'
+            },
+            finalizing: {
+              duration: 10,
+              unit: 'minutes',
+              message: 'Finalizing your orders. Almost complete...'
+            }
+          },
+          totalProcessingMinutes: 30,
+          bufferMinutes: 5
+        },
+        messages: {
+          beforeExport: 'Preparing to export orders to processing system...',
+          exportSuccess: 'Your orders have been successfully sent to MTN for processing.',
+          stages: {
+            queued: {
+              title: 'Queued for Processing',
+              description: 'Your orders are in the queue and will be processed shortly.',
+              icon: 'clock'
+            },
+            sent: {
+              title: 'Sent to MTN',
+              description: 'Orders have been transmitted to MTN processing system.',
+              icon: 'send'
+            },
+            processing: {
+              title: 'Processing',
+              description: 'Your orders are being processed. This usually takes 15-30 minutes.',
+              icon: 'loader'
+            },
+            completed: {
+              title: 'Completed',
+              description: 'Your orders have been successfully processed and delivered.',
+              icon: 'check-circle'
+            },
+            failed: {
+              title: 'Processing Failed',
+              description: 'Some orders could not be processed. Please contact support.',
+              icon: 'alert-circle'
+            }
+          }
+        },
+        autoComplete: {
+          enabled: true,
+          strategy: 'fixed_time',
+          fixedTimeMinutes: 30,
+          successRate: 95
+        }
+      });
+      
+      await defaultSettings.save();
+      console.log('✅ Default export settings created');
+    }
+  } catch (error) {
+    console.error('❌ Error initializing export settings:', error);
+  }
+};
+
+// Run initializations
+initializeSystemStatus();
+initializeDefaultSettings();
 
 // =============================================
 // 1. DASHBOARD & ANALYTICS APIs
@@ -63,7 +396,7 @@ router.get('/verify', async (req, res) => {
   }
 });
 
-// Get dashboard statistics
+// Get dashboard statistics with system status
 router.get('/dashboard/stats', async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
@@ -71,6 +404,10 @@ router.get('/dashboard/stats', async (req, res) => {
     const dateFilter = {};
     if (startDate) dateFilter.$gte = new Date(startDate);
     if (endDate) dateFilter.$lte = new Date(endDate);
+    
+    // Get system status for last export info
+    const systemStatus = await SystemStatus.findById('current_status')
+      .populate('lastExport.exportedBy', 'fullName');
     
     const stats = await Promise.all([
       User.aggregate([
@@ -124,7 +461,13 @@ router.get('/dashboard/stats', async (req, res) => {
         transactions: stats[1],
         today: stats[2][0] || { todaySales: 0, todayTransactions: 0 },
         activeProducts: stats[3],
-        totalWalletBalance: stats[4][0]?.totalWalletBalance || 0
+        totalWalletBalance: stats[4][0]?.totalWalletBalance || 0,
+        lastExport: systemStatus?.lastExport,
+        systemStatus: {
+          health: systemStatus?.systemHealth?.status,
+          isProcessing: systemStatus?.currentProcessing?.isProcessing,
+          activeExports: systemStatus?.currentProcessing?.activeExports?.length || 0
+        }
       }
     });
   } catch (error) {
@@ -932,16 +1275,16 @@ router.get('/transactions/:transactionId', async (req, res) => {
   }
 });
 
-// Update order status
+// Update order status (now with 'sent' status support)
 router.patch('/transactions/:transactionId/status', async (req, res) => {
   try {
     const { transactionId } = req.params;
     const { status, reason } = req.body;
     
-    if (!['pending', 'successful', 'failed'].includes(status)) {
+    if (!['pending', 'sent', 'successful', 'failed'].includes(status)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid status. Must be pending, successful, or failed'
+        message: 'Invalid status. Must be pending, sent, successful, or failed'
       });
     }
     
@@ -961,6 +1304,7 @@ router.patch('/transactions/:transactionId/status', async (req, res) => {
     
     const oldStatus = transaction.status;
     
+    // Handle refunds for failed transactions
     if (oldStatus === 'successful' && status === 'failed') {
       const user = await User.findById(transaction.user);
       if (user) {
@@ -979,34 +1323,6 @@ router.patch('/transactions/:transactionId/status', async (req, res) => {
           status: 'completed',
           description: `Refund for failed transaction ${transaction.transactionId}`
         });
-      }
-    }
-    
-    if ((oldStatus === 'failed' || oldStatus === 'pending') && status === 'successful') {
-      const user = await User.findById(transaction.user);
-      if (user) {
-        if (user.wallet.balance >= transaction.amount) {
-          const balanceBefore = user.wallet.balance;
-          user.wallet.balance -= transaction.amount;
-          await user.save();
-          
-          await WalletTransaction.create({
-            user: transaction.user,
-            type: 'debit',
-            amount: transaction.amount,
-            balanceBefore: balanceBefore,
-            balanceAfter: user.wallet.balance,
-            purpose: 'purchase',
-            reference: transaction.transactionId,
-            status: 'completed',
-            description: `Payment for transaction ${transaction.transactionId}`
-          });
-        } else {
-          return res.status(400).json({
-            success: false,
-            message: 'User has insufficient wallet balance for this status change'
-          });
-        }
       }
     }
     
@@ -1121,50 +1437,6 @@ router.post('/transactions/:transactionId/reverse', async (req, res) => {
   }
 });
 
-// Manual transaction retry
-router.post('/transactions/:transactionId/retry', async (req, res) => {
-  try {
-    const { transactionId } = req.params;
-    
-    const transaction = await Transaction.findOne({
-      $or: [
-        { _id: transactionId },
-        { transactionId: transactionId }
-      ]
-    });
-    
-    if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transaction not found'
-      });
-    }
-    
-    if (transaction.status === 'successful') {
-      return res.status(400).json({
-        success: false,
-        message: 'Transaction already successful'
-      });
-    }
-    
-    transaction.status = 'processing';
-    transaction.retryCount = (transaction.retryCount || 0) + 1;
-    await transaction.save();
-    
-    res.json({
-      success: true,
-      message: 'Transaction retry initiated',
-      data: transaction
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error retrying transaction',
-      error: error.message
-    });
-  }
-});
-
 // Bulk update order statuses
 router.post('/transactions/bulk-status-update', async (req, res) => {
   try {
@@ -1177,7 +1449,7 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
       });
     }
     
-    if (!['pending', 'successful', 'failed'].includes(status)) {
+    if (!['pending', 'sent', 'successful', 'failed'].includes(status)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid status'
@@ -1239,15 +1511,197 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
   }
 });
 
+// =============================================
+// 6. EXPORT MANAGEMENT WITH SETTINGS
+// =============================================
 
-// Preview export with status change warning
+// Get export settings
+router.get('/export-settings', async (req, res) => {
+  try {
+    const settings = await ExportSettings.find()
+      .populate('createdBy', 'fullName')
+      .populate('lastModifiedBy', 'fullName')
+      .sort({ isActive: -1, createdAt: -1 });
+    
+    res.json({
+      success: true,
+      data: settings
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching export settings',
+      error: error.message
+    });
+  }
+});
+
+// Get active export settings
+router.get('/export-settings/active', async (req, res) => {
+  try {
+    const activeSettings = await ExportSettings.findOne({ isActive: true });
+    const systemStatus = await SystemStatus.findById('current_status')
+      .populate('lastExport.exportedBy', 'fullName');
+    
+    res.json({
+      success: true,
+      data: {
+        settings: activeSettings,
+        systemStatus: systemStatus,
+        lastExport: systemStatus?.lastExport,
+        currentlyProcessing: systemStatus?.currentProcessing?.isProcessing || false
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching export settings',
+      error: error.message
+    });
+  }
+});
+
+// Create or update export settings
+router.post('/export-settings', async (req, res) => {
+  try {
+    const { settingName = 'default', ...settingsData } = req.body;
+    
+    // Deactivate other settings if this will be active
+    if (settingsData.isActive) {
+      await ExportSettings.updateMany(
+        { settingName: { $ne: settingName } },
+        { isActive: false }
+      );
+    }
+    
+    const settings = await ExportSettings.findOneAndUpdate(
+      { settingName },
+      {
+        ...settingsData,
+        settingName,
+        lastModifiedBy: req.userId,
+        createdBy: req.userId
+      },
+      { new: true, upsert: true }
+    );
+    
+    res.json({
+      success: true,
+      message: 'Export settings updated successfully',
+      data: settings
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error updating export settings',
+      error: error.message
+    });
+  }
+});
+
+// Get export history
+router.get('/export-history', async (req, res) => {
+  try {
+    const { 
+      status,
+      startDate,
+      endDate,
+      page = 1, 
+      limit = 20 
+    } = req.query;
+    
+    const filter = {};
+    if (status) filter['status.current'] = status;
+    if (startDate || endDate) {
+      filter['timestamps.exportedAt'] = {};
+      if (startDate) filter['timestamps.exportedAt'].$gte = new Date(startDate);
+      if (endDate) filter['timestamps.exportedAt'].$lte = new Date(endDate);
+    }
+    
+    const history = await ExportHistory.find(filter)
+      .sort({ 'timestamps.exportedAt': -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .populate('exportedBy', 'fullName email')
+      .lean();
+    
+    const total = await ExportHistory.countDocuments(filter);
+    
+    res.json({
+      success: true,
+      data: history,
+      pagination: {
+        total,
+        page: parseInt(page),
+        pages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching export history',
+      error: error.message
+    });
+  }
+});
+
+// Get system status
+router.get('/system-status', async (req, res) => {
+  try {
+    const systemStatus = await SystemStatus.findById('current_status')
+      .populate('lastExport.exportedBy', 'fullName');
+    
+    const activeSettings = await ExportSettings.findOne({ isActive: true });
+    
+    // Format last export time
+    let lastExportDisplay = 'No exports yet';
+    if (systemStatus?.lastExport?.exportedAt) {
+      const timeDiff = Date.now() - new Date(systemStatus.lastExport.exportedAt);
+      const minutes = Math.floor(timeDiff / 60000);
+      const hours = Math.floor(minutes / 60);
+      const days = Math.floor(hours / 24);
+      
+      if (days > 0) {
+        lastExportDisplay = `${days} day${days > 1 ? 's' : ''} ago`;
+      } else if (hours > 0) {
+        lastExportDisplay = `${hours} hour${hours > 1 ? 's' : ''} ago`;
+      } else if (minutes > 0) {
+        lastExportDisplay = `${minutes} minute${minutes > 1 ? 's' : ''} ago`;
+      } else {
+        lastExportDisplay = 'Just now';
+      }
+      
+      lastExportDisplay += ` - ${systemStatus.lastExport.totalOrders} orders by ${systemStatus.lastExport.exportedBy?.fullName || 'System'}`;
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        systemHealth: systemStatus?.systemHealth,
+        lastExport: systemStatus?.lastExport,
+        lastExportDisplay,
+        currentProcessing: systemStatus?.currentProcessing,
+        statistics: systemStatus?.statistics,
+        activeSettingsProfile: activeSettings?.settingName,
+        userMessage: systemStatus?.userMessage
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching system status',
+      error: error.message
+    });
+  }
+});
+
+// Preview export with impact analysis
 router.post('/orders/export/preview', async (req, res) => {
   try {
     const { 
       startDate, 
       endDate, 
-      status = 'pending',
-      markAsSuccessful = false
+      status = 'pending'
     } = req.body;
     
     const filter = {
@@ -1263,47 +1717,38 @@ router.post('/orders/export/preview', async (req, res) => {
     
     const orders = await Transaction.find(filter)
       .sort({ createdAt: -1 })
-      .limit(40)
+      .limit(100)
       .populate('dataDetails.product', 'name capacity')
       .populate('user', 'fullName wallet')
       .lean();
     
+    // Get active settings to show processing time
+    const activeSettings = await ExportSettings.findOne({ isActive: true });
+    
     const exportData = orders.map(order => ({
       transactionId: order.transactionId,
       beneficiaryNumber: order.dataDetails?.beneficiaryNumber || 'N/A',
-      capacity: order.dataDetails?.capacity || 
-        (order.dataDetails?.product?.capacity ? 
-          `${order.dataDetails.product.capacity.value}${order.dataDetails.product.capacity.unit}` : 
-          'N/A'),
+      capacity: order.dataDetails?.capacity || 'N/A',
       currentStatus: order.status,
       userName: order.user?.fullName,
-      walletBalance: order.user?.wallet?.balance,
-      orderAmount: order.amount,
-      sufficientBalance: order.user?.wallet?.balance >= order.amount,
+      amount: order.amount,
       date: order.createdAt
     }));
     
-    let impactSummary = null;
-    if (status === 'pending' && markAsSuccessful) {
-      const totalAmount = exportData.reduce((sum, order) => sum + order.orderAmount, 0);
-      const ordersWithInsufficientBalance = exportData.filter(order => !order.sufficientBalance);
-      
-      impactSummary = {
-        totalOrdersToProcess: exportData.length,
-        totalAmountToDeduct: totalAmount,
-        ordersWithInsufficientBalance: ordersWithInsufficientBalance.length,
-        warning: 'These pending orders will be marked as SUCCESSFUL and amounts will be deducted from user wallets'
-      };
-    }
+    const impactSummary = {
+      totalOrdersToExport: exportData.length,
+      totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
+      estimatedProcessingTime: activeSettings?.autoComplete?.fixedTimeMinutes || activeSettings?.timeSettings?.totalProcessingMinutes || 30,
+      autoCompleteEnabled: activeSettings?.autoComplete?.enabled || false,
+      successRate: activeSettings?.autoComplete?.successRate || 95
+    };
     
     res.json({
       success: true,
-      message: `Found ${exportData.length} orders (max 40 shown)`,
+      message: `Found ${exportData.length} orders ready for export`,
       data: exportData,
       count: exportData.length,
-      maxExportLimit: 40,
-      willMarkAsSuccessful: markAsSuccessful,
-      impactSummary: impactSummary
+      impactSummary
     });
   } catch (error) {
     res.status(500).json({
@@ -1314,8 +1759,341 @@ router.post('/orders/export/preview', async (req, res) => {
   }
 });
 
+// MAIN EXPORT ROUTE - FIXED VERSION
+router.post('/orders/export/excel', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  let transactionCommitted = false; // Track if transaction was committed
+  
+  try {
+    const { 
+      startDate, 
+      endDate, 
+      status = 'pending',
+      markAsSuccessful = false
+    } = req.body;
+    
+    // Get active export settings
+    let exportSettings = await ExportSettings.findOne({ isActive: true });
+    
+    if (!exportSettings) {
+      exportSettings = await ExportSettings.create({
+        settingName: 'default',
+        isActive: true,
+        createdBy: req.userId,
+        autoComplete: {
+          enabled: true,
+          strategy: 'fixed_time',
+          fixedTimeMinutes: 30,
+          successRate: 95
+        }
+      });
+    }
+    
+    // Build filter
+    const filter = {
+      type: 'data_purchase',
+      status: status
+    };
+    
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) filter.createdAt.$gte = new Date(startDate);
+      if (endDate) filter.createdAt.$lte = new Date(endDate);
+    }
+    
+    // Fetch orders
+    const orders = await Transaction.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .populate('dataDetails.product', 'name capacity')
+      .populate('user', 'fullName phone wallet')
+      .session(session);
+    
+    if (orders.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'No orders found for export'
+      });
+    }
+    
+    // Generate export ID and batch ID
+    const exportCount = await ExportHistory.countDocuments();
+    const exportId = `EXP-${Date.now()}-${String(exportCount + 1).padStart(4, '0')}`;
+    const batchId = `BATCH-${exportId}`;
+    
+    const processingMinutes = exportSettings.autoComplete?.fixedTimeMinutes || 30;
+    const estimatedCompletionTime = new Date(Date.now() + processingMinutes * 60000);
+    
+    // Create export history
+    const exportHistory = new ExportHistory({
+      exportId,
+      batchNumber: exportCount + 1,
+      exportDetails: {
+        totalOrders: orders.length,
+        totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
+        orderIds: orders.map(o => o._id),
+        exportMethod: 'manual',
+        triggerSource: 'admin_dashboard'
+      },
+      timestamps: {
+        exportedAt: new Date(),
+        estimatedCompletionTime: markAsSuccessful ? estimatedCompletionTime : null,
+        phases: {
+          processing: { 
+            startedAt: new Date(),
+            estimatedDuration: processingMinutes
+          }
+        }
+      },
+      status: {
+        current: markAsSuccessful ? 'processing' : 'exported',
+        history: [{
+          status: markAsSuccessful ? 'processing' : 'exported',
+          timestamp: new Date(),
+          message: markAsSuccessful ? 'Orders sent to MTN for processing' : 'Orders exported',
+          updatedBy: req.userId
+        }]
+      },
+      settingsUsed: {
+        settingName: exportSettings.settingName,
+        totalProcessingMinutes: processingMinutes,
+        autoCompleteEnabled: exportSettings.autoComplete?.enabled || false,
+        successRate: exportSettings.autoComplete?.successRate || 95,
+        messages: exportSettings.messages
+      },
+      exportedBy: req.userId
+    });
+    
+    await exportHistory.save({ session });
+    
+    // Update orders to 'sent' status when markAsSuccessful is true
+    if (markAsSuccessful) {
+      const bulkOps = orders.map(order => ({
+        updateOne: {
+          filter: { _id: order._id },
+          update: {
+            $set: {
+              status: 'sent', // Mark as 'sent' not 'successful'
+              exportedAt: new Date(),
+              'metadata.exportId': exportId,
+              'metadata.batchId': batchId,
+              'metadata.estimatedCompletion': estimatedCompletionTime,
+              'metadata.processingMinutes': processingMinutes
+            }
+          }
+        }
+      }));
+      
+      await Transaction.bulkWrite(bulkOps, { session });
+    }
+    
+    // Update system status
+    await SystemStatus.findOneAndUpdate(
+      { _id: 'current_status' },
+      {
+        $set: {
+          lastExport: {
+            exportId,
+            exportedAt: new Date(),
+            totalOrders: orders.length,
+            status: markAsSuccessful ? 'processing' : 'exported',
+            exportedBy: req.userId,
+            processingMinutes: markAsSuccessful ? processingMinutes : 0,
+            completedAt: null
+          },
+          'currentProcessing.isProcessing': markAsSuccessful,
+          'currentProcessing.activeExports': markAsSuccessful ? [{
+            exportId,
+            startedAt: new Date(),
+            estimatedCompletion: estimatedCompletionTime,
+            processingMinutes,
+            progress: 0,
+            orderCount: orders.length
+          }] : [],
+          'statistics.today.lastUpdated': new Date()
+        },
+        $inc: {
+          'statistics.today.totalExports': 1,
+          'statistics.today.totalOrders': orders.length
+        }
+      },
+      { upsert: true, session }
+    );
+    
+    // Create batch record
+    await Batch.create([{
+      batchId,
+      batchNumber: exportCount + 1,
+      exportedBy: req.userId,
+      exportDate: new Date(),
+      processingStatus: markAsSuccessful ? 'sent_to_third_party' : 'exported',
+      orders: orders.map(o => ({
+        transactionId: o.transactionId,
+        beneficiaryNumber: o.dataDetails?.beneficiaryNumber,
+        capacity: o.dataDetails?.capacity,
+        amount: o.amount,
+        status: markAsSuccessful ? 'sent' : o.status,
+        userName: o.user?.fullName,
+        userId: o.user?._id
+      })),
+      stats: {
+        totalOrders: orders.length,
+        processedOrders: 0,
+        failedOrders: 0,
+        totalAmount: orders.reduce((sum, o) => sum + o.amount, 0)
+      }
+    }], { session });
+    
+    // Send notifications
+    const userMessages = new Map();
+    orders.forEach(order => {
+      const userIdStr = order.user._id.toString();
+      if (!userMessages.has(userIdStr)) {
+        userMessages.set(userIdStr, { userId: order.user._id, orderCount: 0 });
+      }
+      userMessages.get(userIdStr).orderCount++;
+    });
+    
+    const notifications = Array.from(userMessages.values()).map(msg => ({
+      user: msg.userId,
+      title: markAsSuccessful ? 'Orders Sent for Processing' : 'Orders Exported',
+      message: markAsSuccessful 
+        ? `${msg.orderCount} order(s) sent to MTN for processing. Estimated completion in ${processingMinutes} minutes.`
+        : `${msg.orderCount} order(s) exported successfully.`,
+      type: 'info',
+      category: 'transaction'
+    }));
+    
+    await Notification.insertMany(notifications, { session });
+    
+    // COMMIT TRANSACTION HERE
+    await session.commitTransaction();
+    transactionCommitted = true; // Mark that transaction was committed
+    session.endSession();
+    
+    // Schedule auto-completion AFTER transaction is committed
+    if (markAsSuccessful && exportSettings.autoComplete?.enabled) {
+      try {
+        scheduleAutoCompletion(exportId, processingMinutes, exportSettings);
+      } catch (scheduleError) {
+        console.error('Error scheduling auto-completion:', scheduleError);
+      }
+    }
+    
+    // Generate Excel file
+    const workbook = XLSX.utils.book_new();
+    
+    const orderData = orders.map(o => ({
+      'Transaction ID': o.transactionId,
+      'Beneficiary': o.dataDetails?.beneficiaryNumber || 'N/A',
+      'Data Bundle': o.dataDetails?.capacity || 'N/A',
+      'Amount (GHS)': o.amount || 0,
+      'Status': markAsSuccessful ? 'Sent to MTN' : (o.status || 'Pending'),
+      'User': o.user?.fullName || 'Unknown'
+    }));
+    
+    const orderSheet = XLSX.utils.json_to_sheet(orderData);
+    XLSX.utils.book_append_sheet(workbook, orderSheet, 'Orders');
+    
+    const summaryData = [{
+      'Export ID': exportId,
+      'Batch ID': batchId,
+      'Export Date': new Date().toLocaleString(),
+      'Total Orders': orders.length,
+      'Total Amount (GHS)': orders.reduce((sum, o) => sum + o.amount, 0).toFixed(2),
+      'Processing Time': markAsSuccessful ? `${processingMinutes} minutes` : 'Not applicable',
+      'Status': markAsSuccessful ? 'Sent to MTN for Processing' : 'Export Only'
+    }];
+    
+    const summarySheet = XLSX.utils.json_to_sheet(summaryData);
+    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
+    
+    const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    
+    console.log(`✅ Export ${exportId} completed successfully`);
+    
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="export_${exportId}.xlsx"`);
+    res.send(excelBuffer);
+    
+  } catch (error) {
+    // Only abort if not committed
+    if (!transactionCommitted) {
+      try {
+        await session.abortTransaction();
+      } catch (abortError) {
+        console.error('Error aborting transaction:', abortError);
+      }
+    }
+    
+    try {
+      session.endSession();
+    } catch (sessionError) {
+      console.error('Error ending session:', sessionError);
+    }
+    
+    console.error('Export error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error exporting orders',
+      error: error.message
+    });
+  }
+});
+
+// Check export status
+router.get('/export-status/:exportId', async (req, res) => {
+  try {
+    const { exportId } = req.params;
+    
+    const exportHistory = await ExportHistory.findOne({ exportId })
+      .populate('exportedBy', 'fullName');
+    
+    if (!exportHistory) {
+      return res.status(404).json({
+        success: false,
+        message: 'Export not found'
+      });
+    }
+    
+    // Calculate progress
+    const elapsed = Date.now() - exportHistory.timestamps.exportedAt;
+    const elapsedMinutes = Math.floor(elapsed / 60000);
+    const totalMinutes = exportHistory.settingsUsed.totalProcessingMinutes;
+    const progress = Math.min(100, Math.round((elapsedMinutes / totalMinutes) * 100));
+    
+    res.json({
+      success: true,
+      data: {
+        exportId: exportHistory.exportId,
+        status: exportHistory.status.current,
+        progress,
+        elapsedMinutes,
+        estimatedRemainingMinutes: Math.max(0, totalMinutes - elapsedMinutes),
+        statistics: {
+          totalOrders: exportHistory.exportDetails.totalOrders,
+          successCount: exportHistory.status.successCount || 0,
+          failedCount: exportHistory.status.failedCount || 0
+        },
+        timestamps: exportHistory.timestamps,
+        exportedBy: exportHistory.exportedBy?.fullName
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching export status',
+      error: error.message
+    });
+  }
+});
+
 // =============================================
-// 6. WALLET MANAGEMENT APIs
+// 7. WALLET MANAGEMENT APIs (continued...)
 // =============================================
 
 // Get all wallet transactions
@@ -1444,7 +2222,7 @@ router.post('/wallet/adjust', async (req, res) => {
 });
 
 // =============================================
-// 7. SYSTEM SETTINGS APIs
+// 8. SYSTEM SETTINGS APIs (continued...)
 // =============================================
 
 // Get all system settings
@@ -1522,6 +2300,16 @@ router.post('/settings/maintenance', async (req, res) => {
       );
     }
     
+    // Update system status
+    await SystemStatus.findOneAndUpdate(
+      { _id: 'current_status' },
+      { 
+        'maintenanceMode.enabled': enabled,
+        'maintenanceMode.message': message,
+        'maintenanceMode.startedAt': enabled ? new Date() : null
+      }
+    );
+    
     res.json({
       success: true,
       message: `Maintenance mode ${enabled ? 'enabled' : 'disabled'}`
@@ -1536,7 +2324,7 @@ router.post('/settings/maintenance', async (req, res) => {
 });
 
 // =============================================
-// 8. REPORTS APIs
+// 9. REPORTS APIs (continued...)
 // =============================================
 
 // Generate sales report
@@ -1601,87 +2389,6 @@ router.get('/reports/sales', async (req, res) => {
   }
 });
 
-// Generate user activity report
-router.get('/reports/user-activity', async (req, res) => {
-  try {
-    const { startDate, endDate, role } = req.query;
-    
-    const userFilter = {};
-    if (role) userFilter.role = role;
-    
-    const users = await User.find(userFilter).select('_id fullName email role');
-    const userIds = users.map(u => u._id);
-    
-    const transactionFilter = {
-      user: { $in: userIds }
-    };
-    
-    if (startDate || endDate) {
-      transactionFilter.createdAt = {};
-      if (startDate) transactionFilter.createdAt.$gte = new Date(startDate);
-      if (endDate) transactionFilter.createdAt.$lte = new Date(endDate);
-    }
-    
-    const activity = await Transaction.aggregate([
-      { $match: transactionFilter },
-      {
-        $group: {
-          _id: '$user',
-          totalTransactions: { $sum: 1 },
-          totalSpent: { $sum: '$amount' },
-          successfulTransactions: {
-            $sum: { $cond: [{ $eq: ['$status', 'successful'] }, 1, 0] }
-          },
-          failedTransactions: {
-            $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
-          }
-        }
-      },
-      {
-        $lookup: {
-          from: 'reseller_users',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'userInfo'
-        }
-      },
-      { $unwind: '$userInfo' },
-      {
-        $project: {
-          user: {
-            id: '$userInfo._id',
-            fullName: '$userInfo.fullName',
-            email: '$userInfo.email',
-            role: '$userInfo.role'
-          },
-          totalTransactions: 1,
-          totalSpent: 1,
-          successfulTransactions: 1,
-          failedTransactions: 1,
-          successRate: {
-            $multiply: [
-              { $divide: ['$successfulTransactions', '$totalTransactions'] },
-              100
-            ]
-          }
-        }
-      },
-      { $sort: { totalSpent: -1 } }
-    ]);
-    
-    res.json({
-      success: true,
-      data: activity
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error generating user activity report',
-      error: error.message
-    });
-  }
-});
-
 // Export transactions to CSV
 router.get('/reports/export/transactions', async (req, res) => {
   try {
@@ -1738,185 +2445,10 @@ router.get('/reports/export/transactions', async (req, res) => {
 });
 
 // =============================================
-// 9. API MANAGEMENT
+// 10. BATCH MANAGEMENT (continued...)
 // =============================================
 
-// Get API logs
-router.get('/api-logs', async (req, res) => {
-  try {
-    const { userId, startDate, endDate, page = 1, limit = 20 } = req.query;
-    
-    const filter = {};
-    if (userId) filter.user = userId;
-    if (startDate || endDate) {
-      filter.createdAt = {};
-      if (startDate) filter.createdAt.$gte = new Date(startDate);
-      if (endDate) filter.createdAt.$lte = new Date(endDate);
-    }
-    
-    const logs = await ApiLog.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .populate('user', 'fullName email')
-      .lean();
-    
-    const total = await ApiLog.countDocuments(filter);
-    
-    res.json({
-      success: true,
-      data: logs,
-      pagination: {
-        total,
-        page: parseInt(page),
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching API logs',
-      error: error.message
-    });
-  }
-});
-
-// Generate API key for user
-router.post('/users/:userId/generate-api-key', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { webhookUrl } = req.body;
-    
-    const apiKey = 'pk_' + crypto.randomBytes(32).toString('hex');
-    const apiSecret = crypto.randomBytes(32).toString('hex');
-    const hashedSecret = await bcrypt.hash(apiSecret, 10);
-    
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        'apiAccess.enabled': true,
-        'apiAccess.apiKey': apiKey,
-        'apiAccess.apiSecret': hashedSecret,
-        'apiAccess.webhookUrl': webhookUrl
-      },
-      { new: true }
-    ).select('fullName email apiAccess');
-    
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: 'API credentials generated successfully',
-      data: {
-        apiKey,
-        apiSecret,
-        webhookUrl
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error generating API credentials',
-      error: error.message
-    });
-  }
-});
-
-// Revoke API access
-router.delete('/users/:userId/revoke-api-access', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        'apiAccess.enabled': false,
-        'apiAccess.apiKey': null,
-        'apiAccess.apiSecret': null
-      },
-      { new: true }
-    ).select('fullName email');
-    
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'User not found'
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: 'API access revoked successfully'
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error revoking API access',
-      error: error.message
-    });
-  }
-});
-
-// =============================================
-// 10. NOTIFICATIONS
-// =============================================
-
-// Send broadcast notification
-router.post('/notifications/broadcast', async (req, res) => {
-  try {
-    const { title, message, type = 'info', roles, userIds } = req.body;
-    
-    let recipients = [];
-    
-    if (userIds && userIds.length > 0) {
-      recipients = userIds;
-    } else if (roles && roles.length > 0) {
-      const users = await User.find({ 
-        role: { $in: roles },
-        status: 'active'
-      }).select('_id');
-      recipients = users.map(u => u._id);
-    } else {
-      const users = await User.find({ status: 'active' }).select('_id');
-      recipients = users.map(u => u._id);
-    }
-    
-    const notifications = recipients.map(userId => ({
-      user: userId,
-      title,
-      message,
-      type,
-      category: 'system'
-    }));
-    
-    await Notification.insertMany(notifications);
-    
-    res.json({
-      success: true,
-      message: `Notification sent to ${recipients.length} users`
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error sending broadcast',
-      error: error.message
-    });
-  }
-});
-
-
-// Add these new routes to your admin.js file
-
-// =============================================
-// BATCH MANAGEMENT APIs
-// =============================================
-
-// Get all batches with filters
+// Get all batches
 router.get('/batches', async (req, res) => {
   try {
     const { 
@@ -1929,7 +2461,7 @@ router.get('/batches', async (req, res) => {
     } = req.query;
     
     const filter = {};
-    if (status) filter.status = status;
+    if (status) filter.processingStatus = status;
     if (startDate || endDate) {
       filter.exportDate = {};
       if (startDate) filter.exportDate.$gte = new Date(startDate);
@@ -1938,8 +2470,7 @@ router.get('/batches', async (req, res) => {
     if (search) {
       filter.$or = [
         { batchId: { $regex: search, $options: 'i' } },
-        { 'orders.beneficiaryNumber': { $regex: search, $options: 'i' } },
-        { 'orders.transactionId': { $regex: search, $options: 'i' } }
+        { 'orders.beneficiaryNumber': { $regex: search, $options: 'i' } }
       ];
     }
     
@@ -1967,354 +2498,6 @@ router.get('/batches', async (req, res) => {
       message: 'Error fetching batches',
       error: error.message
     });
-  }
-});
-
-// Get single batch details
-router.get('/batches/:batchId', async (req, res) => {
-  try {
-    const { batchId } = req.params;
-    const { search, page = 1, limit = 40 } = req.query;
-    
-    const batch = await Batch.findOne({ 
-      $or: [
-        { _id: batchId },
-        { batchId: batchId }
-      ]
-    }).populate('exportedBy', 'fullName email');
-    
-    if (!batch) {
-      return res.status(404).json({
-        success: false,
-        message: 'Batch not found'
-      });
-    }
-    
-    // Filter orders if search is provided
-    let orders = batch.orders;
-    if (search) {
-      orders = orders.filter(order => 
-        order.beneficiaryNumber.includes(search) ||
-        order.transactionId.includes(search) ||
-        order.userName?.toLowerCase().includes(search.toLowerCase())
-      );
-    }
-    
-    // Paginate orders
-    const startIndex = (page - 1) * limit;
-    const endIndex = page * limit;
-    const paginatedOrders = orders.slice(startIndex, endIndex);
-    
-    res.json({
-      success: true,
-      data: {
-        ...batch.toObject(),
-        orders: paginatedOrders,
-        ordersPagination: {
-          total: orders.length,
-          page: parseInt(page),
-          pages: Math.ceil(orders.length / limit)
-        }
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching batch details',
-      error: error.message
-    });
-  }
-});
-
-// Re-export a batch
-router.post('/batches/:batchId/re-export', async (req, res) => {
-  try {
-    const { batchId } = req.params;
-    
-    const batch = await Batch.findOne({ 
-      $or: [
-        { _id: batchId },
-        { batchId: batchId }
-      ]
-    });
-    
-    if (!batch) {
-      return res.status(404).json({
-        success: false,
-        message: 'Batch not found'
-      });
-    }
-    
-    // Generate Excel from batch data
-    const excelData = batch.orders.map(order => ({
-      'Beneficiary Number': order.beneficiaryNumber,
-      'Capacity': order.capacity
-    }));
-    
-    const workbook = XLSX.utils.book_new();
-    const worksheet = XLSX.utils.json_to_sheet(excelData);
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Orders');
-    
-    // Add batch summary
-    const summaryData = [{
-      'Batch ID': batch.batchId,
-      'Export Date': batch.exportDate,
-      'Total Orders': batch.stats.totalOrders,
-      'Processed': batch.stats.processedOrders,
-      'Failed': batch.stats.failedOrders,
-      'Total Amount': batch.stats.totalAmount,
-      'Exported By': req.user.fullName
-    }];
-    
-    const summarySheet = XLSX.utils.json_to_sheet(summaryData);
-    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
-    
-    const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-    
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="batch_${batch.batchId}.xlsx"`);
-    res.send(excelBuffer);
-    
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error re-exporting batch',
-      error: error.message
-    });
-  }
-});
-
-// Updated Export orders to Excel with batch tracking
-// Replace the /orders/export/excel route in your admin.js with this optimized version
-
-// FIXED: Export orders to Excel with batch tracking
-// This version does NOT deduct money (since money was already deducted when order was placed)
-router.post('/orders/export/excel', async (req, res) => {
-  try {
-    const { 
-      startDate, 
-      endDate, 
-      status = 'pending',
-      markAsSuccessful = false,
-      confirmExport = true
-    } = req.body;
-    
-    // Build filter
-    const filter = {
-      type: 'data_purchase',
-      status: status
-    };
-    
-    if (startDate || endDate) {
-      filter.createdAt = {};
-      if (startDate) filter.createdAt.$gte = new Date(startDate);
-      if (endDate) filter.createdAt.$lte = new Date(endDate);
-    }
-    
-    // Fetch orders with populated data
-    const orders = await Transaction.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(40)
-      .populate('dataDetails.product', 'name capacity')
-      .populate('user', 'fullName phone wallet')
-      .lean();
-    
-    if (orders.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'No orders found'
-      });
-    }
-    
-    // Generate batch ID
-    const batchCount = await Batch.countDocuments();
-    const batchId = `BATCH${String(batchCount + 1).padStart(6, '0')}`;
-    const batchNumber = batchCount + 1;
-    
-    const batchOrders = [];
-    let totalAmount = 0;
-    
-    // Prepare batch order data
-    for (const order of orders) {
-      batchOrders.push({
-        transactionId: order.transactionId,
-        beneficiaryNumber: order.dataDetails?.beneficiaryNumber || 'N/A',
-        capacity: order.dataDetails?.capacity || 'N/A',
-        amount: order.amount,
-        status: order.status,
-        userName: order.user?.fullName,
-        userId: order.user?._id
-      });
-      totalAmount += order.amount;
-    }
-    
-    let processedCount = 0;
-    let failedCount = 0;
-    
-    // Process orders if marking as successful
-    if (status === 'pending' && markAsSuccessful) {
-      
-      // IMPORTANT: Do NOT deduct money - it was already deducted when order was placed!
-      // Just update the transaction status
-      
-      const bulkOps = orders.map(order => ({
-        updateOne: {
-          filter: { _id: order._id },
-          update: {
-            $set: {
-              status: 'successful',
-              completedAt: new Date(),
-              statusUpdatedBy: req.userId,
-              statusUpdatedAt: new Date(),
-              statusUpdateReason: `Batch ${batchId} - Exported for processing`,
-              'metadata.batchId': batchId,
-              'metadata.exportedAt': new Date()
-            }
-          }
-        }
-      }));
-      
-      const bulkResult = await Transaction.bulkWrite(bulkOps, { ordered: false });
-      processedCount = bulkResult.modifiedCount;
-      
-      // Update batch order status
-      batchOrders.forEach(order => {
-        const idx = batchOrders.findIndex(bo => bo.transactionId === order.transactionId);
-        if (idx !== -1) batchOrders[idx].status = 'successful';
-      });
-      
-      // Optional: Send bulk notification to users
-      const notifications = orders.map(order => ({
-        user: order.user._id,
-        title: 'Order Processed',
-        message: `Your order ${order.transactionId} has been processed and sent to ${order.dataDetails?.beneficiaryNumber}`,
-        type: 'success',
-        category: 'transaction',
-        relatedTransaction: order._id
-      }));
-      
-      try {
-        await Notification.insertMany(notifications, { ordered: false });
-      } catch (notifError) {
-        console.log('Some notifications may have failed:', notifError.message);
-      }
-    }
-    
-    // Create batch record
-    await Batch.create({
-      batchId,
-      batchNumber,
-      exportedBy: req.userId,
-      orders: batchOrders,
-      stats: {
-        totalOrders: orders.length,
-        processedOrders: processedCount,
-        failedOrders: failedCount,
-        totalAmount: totalAmount,
-        originalStatus: status,
-        markedAsSuccessful: markAsSuccessful
-      },
-      status: processedCount === orders.length ? 'completed' : 
-              processedCount > 0 ? 'partial' : 'exported',
-      fileName: `batch_${batchId}_${new Date().toISOString().split('T')[0]}.xlsx`,
-      notes: 'Orders exported for MTN processing - no wallet changes (already paid)'
-    });
-    
-    // Generate Excel
-    const workbook = XLSX.utils.book_new();
-    
-    // Main sheet with order details
-    const excelData = batchOrders.map(order => ({
-      'Beneficiary Number': order.beneficiaryNumber,
-      'Data Bundle': order.capacity,
-      'Transaction ID': order.transactionId,
-      'Status': order.status,
-      'Amount (GHS)': order.amount
-    }));
-    
-    const worksheet = XLSX.utils.json_to_sheet(excelData);
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Orders');
-    
-    // Add summary sheet
-    const summaryData = [{
-      'Batch ID': batchId,
-      'Export Date': new Date().toISOString(),
-      'Total Orders': orders.length,
-      'Total Amount (GHS)': totalAmount,
-      'Status': markAsSuccessful ? 'Marked as Successful' : 'Exported Only',
-      'Note': 'Payment already collected from users when orders were placed'
-    }];
-    
-    const summarySheet = XLSX.utils.json_to_sheet(summaryData);
-    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
-    
-    // Generate buffer
-    const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-    
-    // Send response
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="batch_${batchId}.xlsx"`);
-    res.setHeader('X-Batch-ID', batchId);
-    res.setHeader('X-Export-Summary', JSON.stringify({
-      batchId,
-      exported: orders.length,
-      processed: processedCount,
-      failed: failedCount,
-      note: 'No wallet changes - orders were already paid'
-    }));
-    
-    res.send(excelBuffer);
-    
-  } catch (error) {
-    console.error('Export error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error exporting batch',
-      error: error.message
-    });
-  }
-});
-
-// Alternative: Ultra-fast export without processing (just export)
-router.post('/orders/export/excel-fast', async (req, res) => {
-  try {
-    const { status = 'pending' } = req.body;
-    
-    // Single query with lean for speed
-    const orders = await Transaction.find({
-      type: 'data_purchase',
-      status: status
-    })
-    .select('transactionId dataDetails.beneficiaryNumber dataDetails.capacity amount')
-    .limit(40)
-    .lean()
-    .exec();
-    
-    if (orders.length === 0) {
-      return res.status(404).json({ success: false, message: 'No orders found' });
-    }
-    
-    // Quick batch ID
-    const batchId = `BATCH${Date.now().toString().slice(-6)}`;
-    
-    // Direct Excel generation
-    const data = orders.map(o => ({
-      'Beneficiary': o.dataDetails?.beneficiaryNumber || 'N/A',
-      'Data': o.dataDetails?.capacity || 'N/A'
-    }));
-    
-    const ws = XLSX.utils.json_to_sheet(data);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Orders');
-    
-    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${batchId}.xlsx"`);
-    res.send(buffer);
-    
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -2361,6 +2544,83 @@ router.get('/batches/stats', async (req, res) => {
     });
   }
 });
+
+// =============================================
+// 11. NOTIFICATIONS
+// =============================================
+
+// Send broadcast notification
+router.post('/notifications/broadcast', async (req, res) => {
+  try {
+    const { title, message, type = 'info', roles, userIds } = req.body;
+    
+    let recipients = [];
+    
+    if (userIds && userIds.length > 0) {
+      recipients = userIds;
+    } else if (roles && roles.length > 0) {
+      const users = await User.find({ 
+        role: { $in: roles },
+        status: 'active'
+      }).select('_id');
+      recipients = users.map(u => u._id);
+    } else {
+      const users = await User.find({ status: 'active' }).select('_id');
+      recipients = users.map(u => u._id);
+    }
+    
+    const notifications = recipients.map(userId => ({
+      user: userId,
+      title,
+      message,
+      type,
+      category: 'system'
+    }));
+    
+    await Notification.insertMany(notifications);
+    
+    res.json({
+      success: true,
+      message: `Notification sent to ${recipients.length} users`
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error sending broadcast',
+      error: error.message
+    });
+  }
+});
+
+// =============================================
+// CRON JOB FOR PERIODIC CHECKS
+// =============================================
+
+cron.schedule('* * * * *', async () => {  // Runs every minute
+  try {
+    const pendingExports = await ExportHistory.find({
+      'status.current': { $in: ['exporting', 'processing'] },
+      'timestamps.estimatedCompletionTime': { $lte: new Date() }
+    });
+    
+    for (const exportData of pendingExports) {
+      // Check if it's not already being processed
+      if (!scheduledJobs.has(exportData.exportId)) {
+        const settings = await ExportSettings.findOne({ 
+          settingName: exportData.settingsUsed?.settingName || 'default'
+        });
+        
+        if (settings && settings.autoComplete?.enabled) {
+          console.log(`⚠️ Found overdue export ${exportData.exportId}, completing now`);
+          await completeExport(exportData.exportId, settings);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Cron job error:', error);
+  }
+});
+
 // =============================================
 // EXPORT ROUTER
 // =============================================
