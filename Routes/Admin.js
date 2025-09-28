@@ -1511,6 +1511,268 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
   }
 });
 
+// Generate API key for a user
+router.post('/users/:id/generate-api-key', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { webhookUrl } = req.body;
+    
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    // Check if user already has API access
+    if (user.apiAccess?.enabled) {
+      return res.status(400).json({
+        success: false,
+        message: 'User already has API access enabled'
+      });
+    }
+    
+    // Generate API credentials
+    const apiKey = 'pk_' + crypto.randomBytes(32).toString('hex');
+    const apiSecret = 'sk_' + crypto.randomBytes(32).toString('hex');
+    const hashedSecret = await bcrypt.hash(apiSecret, 10);
+    
+    // Update user with API access
+    user.apiAccess = {
+      enabled: true,
+      apiKey: apiKey,
+      apiSecret: hashedSecret,
+      webhookUrl: webhookUrl || '',
+      rateLimit: 100,
+      requestCount: 0,
+      lastUsed: null,
+      createdAt: new Date()
+    };
+    
+    await user.save();
+    
+    // Create notification
+    await Notification.create({
+      user: id,
+      title: 'API Access Enabled',
+      message: 'Your API credentials have been generated. Please save them securely.',
+      type: 'success',
+      category: 'system'
+    });
+    
+    res.json({
+      success: true,
+      message: 'API key generated successfully',
+      data: {
+        apiKey: apiKey,
+        apiSecret: apiSecret, // Return plain secret only once
+        webhookUrl: webhookUrl || ''
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error generating API key',
+      error: error.message
+    });
+  }
+});
+
+// Revoke API access for a user
+router.delete('/users/:id/revoke-api-access', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    if (!user.apiAccess?.enabled) {
+      return res.status(400).json({
+        success: false,
+        message: 'User does not have API access enabled'
+      });
+    }
+    
+    // Disable API access
+    user.apiAccess.enabled = false;
+    user.apiAccess.apiKey = null;
+    user.apiAccess.apiSecret = null;
+    user.apiAccess.revokedAt = new Date();
+    await user.save();
+    
+    // Create notification
+    await Notification.create({
+      user: id,
+      title: 'API Access Revoked',
+      message: 'Your API access has been revoked by an administrator.',
+      type: 'warning',
+      category: 'system'
+    });
+    
+    res.json({
+      success: true,
+      message: 'API access revoked successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error revoking API access',
+      error: error.message
+    });
+  }
+});
+
+// Regenerate API key for a user
+router.post('/users/:id/regenerate-api-key', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { webhookUrl } = req.body;
+    
+    const user = await User.findById(id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    if (!user.apiAccess?.enabled) {
+      return res.status(400).json({
+        success: false,
+        message: 'User does not have API access enabled'
+      });
+    }
+    
+    // Generate new API credentials
+    const apiKey = 'pk_' + crypto.randomBytes(32).toString('hex');
+    const apiSecret = 'sk_' + crypto.randomBytes(32).toString('hex');
+    const hashedSecret = await bcrypt.hash(apiSecret, 10);
+    
+    // Update API access with new credentials
+    user.apiAccess.apiKey = apiKey;
+    user.apiAccess.apiSecret = hashedSecret;
+    user.apiAccess.regeneratedAt = new Date();
+    if (webhookUrl !== undefined) {
+      user.apiAccess.webhookUrl = webhookUrl;
+    }
+    
+    await user.save();
+    
+    // Create notification
+    await Notification.create({
+      user: id,
+      title: 'API Credentials Regenerated',
+      message: 'Your API credentials have been regenerated. Previous credentials are now invalid.',
+      type: 'warning',
+      category: 'system'
+    });
+    
+    res.json({
+      success: true,
+      message: 'API key regenerated successfully',
+      data: {
+        apiKey: apiKey,
+        apiSecret: apiSecret, // Return plain secret only once
+        webhookUrl: user.apiAccess.webhookUrl || ''
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error regenerating API key',
+      error: error.message
+    });
+  }
+});
+
+// Get API usage statistics for a user
+router.get('/users/:id/api-stats', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { period = '7days' } = req.query;
+    
+    const user = await User.findById(id).select('apiAccess');
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    if (!user.apiAccess?.enabled) {
+      return res.status(400).json({
+        success: false,
+        message: 'User does not have API access enabled'
+      });
+    }
+    
+    let startDate;
+    switch (period) {
+      case '24hours':
+        startDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        break;
+      case '7days':
+        startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case '30days':
+        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    }
+    
+    const apiLogs = await ApiLog.aggregate([
+      {
+        $match: {
+          user: mongoose.Types.ObjectId(id),
+          createdAt: { $gte: startDate }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: '%Y-%m-%d', date: '$createdAt' }
+          },
+          totalRequests: { $sum: 1 },
+          successfulRequests: {
+            $sum: { $cond: [{ $eq: ['$success', true] }, 1, 0] }
+          },
+          failedRequests: {
+            $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] }
+          },
+          avgResponseTime: { $avg: '$response.responseTime' }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+    
+    res.json({
+      success: true,
+      data: {
+        apiKey: user.apiAccess.apiKey,
+        enabled: user.apiAccess.enabled,
+        requestCount: user.apiAccess.requestCount,
+        rateLimit: user.apiAccess.rateLimit,
+        lastUsed: user.apiAccess.lastUsed,
+        createdAt: user.apiAccess.createdAt,
+        stats: apiLogs
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching API statistics',
+      error: error.message
+    });
+  }
+});
+
 // =============================================
 // 6. EXPORT MANAGEMENT WITH SETTINGS
 // =============================================
