@@ -2022,11 +2022,12 @@ router.post('/orders/export/preview', async (req, res) => {
 });
 
 // MAIN EXPORT ROUTE - FIXED VERSION
+// MAIN EXPORT ROUTE - FIXED VERSION (Number and Capacity Only)
 router.post('/orders/export/excel', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   
-  let transactionCommitted = false; // Track if transaction was committed
+  let transactionCommitted = false;
   
   try {
     const { 
@@ -2139,7 +2140,7 @@ router.post('/orders/export/excel', async (req, res) => {
           filter: { _id: order._id },
           update: {
             $set: {
-              status: 'sent', // Mark as 'sent' not 'successful'
+              status: 'sent',
               exportedAt: new Date(),
               'metadata.exportId': exportId,
               'metadata.batchId': batchId,
@@ -2234,7 +2235,7 @@ router.post('/orders/export/excel', async (req, res) => {
     
     // COMMIT TRANSACTION HERE
     await session.commitTransaction();
-    transactionCommitted = true; // Mark that transaction was committed
+    transactionCommitted = true;
     session.endSession();
     
     // Schedule auto-completion AFTER transaction is committed
@@ -2246,40 +2247,51 @@ router.post('/orders/export/excel', async (req, res) => {
       }
     }
     
-    // Generate Excel file
+    // Generate Excel file - SIMPLIFIED VERSION WITH ONLY NUMBER AND CAPACITY
     const workbook = XLSX.utils.book_new();
     
+    // Main data sheet - ONLY NUMBER AND CAPACITY
     const orderData = orders.map(o => ({
-      'Transaction ID': o.transactionId,
-      'Beneficiary': o.dataDetails?.beneficiaryNumber || 'N/A',
-      'Data Bundle': o.dataDetails?.capacity || 'N/A',
-      'Amount (GHS)': o.amount || 0,
-      'Status': markAsSuccessful ? 'Sent to MTN' : (o.status || 'Pending'),
-      'User': o.user?.fullName || 'Unknown'
+      'Number': o.dataDetails?.beneficiaryNumber || '',
+      'Capacity': o.dataDetails?.capacity || ''
     }));
     
-    const orderSheet = XLSX.utils.json_to_sheet(orderData);
-    XLSX.utils.book_append_sheet(workbook, orderSheet, 'Orders');
+    // Filter out any rows where either Number or Capacity is empty
+    const filteredOrderData = orderData.filter(row => 
+      row.Number && row.Capacity
+    );
     
+    const orderSheet = XLSX.utils.json_to_sheet(filteredOrderData);
+    
+    // Set column widths for better readability
+    orderSheet['!cols'] = [
+      { wch: 15 }, // Number column
+      { wch: 15 }  // Capacity column
+    ];
+    
+    XLSX.utils.book_append_sheet(workbook, orderSheet, 'MTN_Orders');
+    
+    // Optional: Add a summary sheet with metadata (can be removed if not needed)
     const summaryData = [{
       'Export ID': exportId,
-      'Batch ID': batchId,
       'Export Date': new Date().toLocaleString(),
-      'Total Orders': orders.length,
-      'Total Amount (GHS)': orders.reduce((sum, o) => sum + o.amount, 0).toFixed(2),
-      'Processing Time': markAsSuccessful ? `${processingMinutes} minutes` : 'Not applicable',
-      'Status': markAsSuccessful ? 'Sent to MTN for Processing' : 'Export Only'
+      'Total Orders': filteredOrderData.length,
+      'Status': markAsSuccessful ? 'Sent to MTN' : 'Export Only'
     }];
     
     const summarySheet = XLSX.utils.json_to_sheet(summaryData);
     XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
     
+    // Generate Excel buffer
     const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
     
-    console.log(`✅ Export ${exportId} completed successfully`);
+    console.log(`✅ Export ${exportId} completed successfully with ${filteredOrderData.length} valid orders`);
     
+    // Set response headers
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="export_${exportId}.xlsx"`);
+    res.setHeader('Content-Disposition', `attachment; filename="MTN_export_${exportId}.xlsx"`);
+    res.setHeader('X-Export-ID', exportId); // Add export ID to headers for client reference
+    
     res.send(excelBuffer);
     
   } catch (error) {
