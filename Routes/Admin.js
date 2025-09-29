@@ -1968,7 +1968,7 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
     const processingMinutes = exportSettings?.autoComplete?.fixedTimeMinutes || 30;
     const estimatedCompletionTime = new Date(Date.now() + processingMinutes * 60000);
     
-    // Create re-export history with CORRECT enum values from your schema
+    // Create re-export history with CORRECT enum values
     const exportHistory = new ExportHistory({
       exportId: reExportId,
       batchNumber: exportCount + 1,
@@ -1976,15 +1976,15 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
         totalOrders: orders.length,
         totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
         orderIds: orders.map(o => o._id),
-        exportMethod: 'manual',  // FIXED: Use valid enum value from schema
-        triggerSource: 'admin_dashboard'  // FIXED: Use valid enum value from schema
+        exportMethod: 'manual',  // Use valid enum value
+        triggerSource: 'admin_dashboard'  // Use valid enum value
       },
       timestamps: {
         exportedAt: new Date(),
         estimatedCompletionTime: markAsSuccessful ? estimatedCompletionTime : null
       },
       status: {
-        current: markAsSuccessful ? 'processing' : 're-export',  // FIXED: Use 're-export' not 're-exported'
+        current: markAsSuccessful ? 'processing' : 're-export',  // Use 're-export' not 're-exported'
         history: [{
           status: markAsSuccessful ? 'processing' : 're-export',
           timestamp: new Date(),
@@ -2033,7 +2033,7 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
             exportId: reExportId,
             exportedAt: new Date(),
             totalOrders: orders.length,
-            status: markAsSuccessful ? 'processing' : 're-export',  // Use 're-export' here too
+            status: markAsSuccessful ? 'processing' : 're-export',
             exportedBy: req.userId,
             processingMinutes: markAsSuccessful ? processingMinutes : 0,
             completedAt: null
@@ -2059,7 +2059,7 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
       exportedBy: req.userId,
       exportDate: new Date(),
       processingStatus: markAsSuccessful ? 'sent_to_third_party' : 're-exported',
-      status: markAsSuccessful ? 'processing' : 'exported',  // Add proper status
+      status: markAsSuccessful ? 'processing' : 'exported',
       orders: orders.map(o => ({
         transactionId: o.transactionId,
         beneficiaryNumber: o.dataDetails?.beneficiaryNumber,
@@ -2086,14 +2086,23 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
       scheduleAutoCompletion(reExportId, processingMinutes, exportSettings);
     }
     
-    // Generate Excel file - SAME FORMAT: Number and Capacity only
+    // Generate Excel file - WITH NUMERIC CAPACITY ONLY
     const workbook = XLSX.utils.book_new();
     
-    // Main data sheet - ONLY NUMBER AND CAPACITY
-    const orderData = orders.map(o => ({
-      'Number': o.dataDetails?.beneficiaryNumber || '',
-      'Capacity': o.dataDetails?.capacity || ''
-    }));
+    // Main data sheet - NUMBER AND NUMERIC CAPACITY
+    const orderData = orders.map(o => {
+      // Extract numeric value from capacity (remove GB, MB, etc.)
+      let capacityValue = o.dataDetails?.capacity || '';
+      if (typeof capacityValue === 'string') {
+        // Extract only numbers and decimal points from the capacity string
+        capacityValue = capacityValue.replace(/[^0-9.]/g, '');
+      }
+      
+      return {
+        'Number': o.dataDetails?.beneficiaryNumber || '',
+        'Capacity': capacityValue
+      };
+    });
     
     // Filter out any rows where either Number or Capacity is empty
     const filteredOrderData = orderData.filter(row => 
@@ -2153,52 +2162,6 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error re-exporting batch',
-      error: error.message
-    });
-  }
-});
-
-// Get batch details for re-export preview
-router.get('/batches/:batchId/re-export-preview', async (req, res) => {
-  try {
-    const { batchId } = req.params;
-    
-    const batch = await Batch.findOne({ 
-      $or: [
-        { batchId: batchId },
-        { _id: batchId }
-      ]
-    }).populate('exportedBy', 'fullName');
-    
-    if (!batch) {
-      return res.status(404).json({
-        success: false,
-        message: 'Batch not found'
-      });
-    }
-    
-    // Get valid orders (with Number and Capacity)
-    const validOrders = batch.orders.filter(o => 
-      o.beneficiaryNumber && o.capacity
-    );
-    
-    res.json({
-      success: true,
-      data: {
-        batchId: batch.batchId,
-        originalExportDate: batch.exportDate,
-        originalExportedBy: batch.exportedBy?.fullName,
-        totalOrders: batch.orders.length,
-        validOrders: validOrders.length,
-        totalAmount: batch.stats.totalAmount,
-        currentStatus: batch.processingStatus,
-        orders: validOrders.slice(0, 10) // Preview first 10
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching re-export preview',
       error: error.message
     });
   }
@@ -2319,7 +2282,7 @@ router.post('/orders/export/preview', async (req, res) => {
 });
 
 // MAIN EXPORT ROUTE - FIXED VERSION
-// MAIN EXPORT ROUTE - FIXED VERSION (Number and Capacity Only)
+// MAIN EXPORT ROUTE - FIXED VERSION (Number and Numeric Capacity Only)
 router.post('/orders/export/excel', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -2544,14 +2507,23 @@ router.post('/orders/export/excel', async (req, res) => {
       }
     }
     
-    // Generate Excel file - SIMPLIFIED VERSION WITH ONLY NUMBER AND CAPACITY
+    // Generate Excel file - WITH NUMERIC CAPACITY ONLY
     const workbook = XLSX.utils.book_new();
     
-    // Main data sheet - ONLY NUMBER AND CAPACITY
-    const orderData = orders.map(o => ({
-      'Number': o.dataDetails?.beneficiaryNumber || '',
-      'Capacity': o.dataDetails?.capacity || ''
-    }));
+    // Main data sheet - NUMBER AND NUMERIC CAPACITY
+    const orderData = orders.map(o => {
+      // Extract numeric value from capacity (remove GB, MB, etc.)
+      let capacityValue = o.dataDetails?.capacity || '';
+      if (typeof capacityValue === 'string') {
+        // Extract only numbers and decimal points from the capacity string
+        capacityValue = capacityValue.replace(/[^0-9.]/g, '');
+      }
+      
+      return {
+        'Number': o.dataDetails?.beneficiaryNumber || '',
+        'Capacity': capacityValue
+      };
+    });
     
     // Filter out any rows where either Number or Capacity is empty
     const filteredOrderData = orderData.filter(row => 
@@ -2568,7 +2540,7 @@ router.post('/orders/export/excel', async (req, res) => {
     
     XLSX.utils.book_append_sheet(workbook, orderSheet, 'MTN_Orders');
     
-    // Optional: Add a summary sheet with metadata (can be removed if not needed)
+    // Optional: Add a summary sheet with metadata
     const summaryData = [{
       'Export ID': exportId,
       'Export Date': new Date().toLocaleString(),
@@ -2587,7 +2559,7 @@ router.post('/orders/export/excel', async (req, res) => {
     // Set response headers
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="MTN_export_${exportId}.xlsx"`);
-    res.setHeader('X-Export-ID', exportId); // Add export ID to headers for client reference
+    res.setHeader('X-Export-ID', exportId);
     
     res.send(excelBuffer);
     
@@ -2615,7 +2587,6 @@ router.post('/orders/export/excel', async (req, res) => {
     });
   }
 });
-
 // Check export status
 router.get('/export-status/:exportId', async (req, res) => {
   try {
