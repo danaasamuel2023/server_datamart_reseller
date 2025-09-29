@@ -1907,6 +1907,279 @@ router.get('/export-history', async (req, res) => {
   }
 });
 
+// Re-export orders from a previous batch/export
+router.post('/batches/:batchId/re-export', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  let transactionCommitted = false;
+  
+  try {
+    const { batchId } = req.params;
+    const { markAsSuccessful = false } = req.body;
+    
+    // Find the batch
+    const batch = await Batch.findOne({ 
+      $or: [
+        { batchId: batchId },
+        { _id: batchId }
+      ]
+    }).populate('exportedBy', 'fullName');
+    
+    if (!batch) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'Batch not found'
+      });
+    }
+    
+    // Get the original export details from ExportHistory
+    const originalExport = await ExportHistory.findOne({ 
+      exportId: batch.batchId.replace('BATCH-', '') 
+    });
+    
+    // Fetch the transactions from the batch
+    const orderIds = batch.orders.map(o => o.transactionId);
+    const orders = await Transaction.find({
+      transactionId: { $in: orderIds }
+    })
+    .populate('dataDetails.product', 'name capacity')
+    .populate('user', 'fullName phone wallet')
+    .session(session);
+    
+    if (orders.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'No orders found for re-export'
+      });
+    }
+    
+    // Generate new re-export ID
+    const exportCount = await ExportHistory.countDocuments();
+    const reExportId = `RE-EXP-${Date.now()}-${String(exportCount + 1).padStart(4, '0')}`;
+    const reBatchId = `BATCH-${reExportId}`;
+    
+    // Get export settings
+    let exportSettings = await ExportSettings.findOne({ isActive: true });
+    if (!exportSettings) {
+      exportSettings = await ExportSettings.findOne({ settingName: 'default' });
+    }
+    
+    const processingMinutes = exportSettings?.autoComplete?.fixedTimeMinutes || 30;
+    const estimatedCompletionTime = new Date(Date.now() + processingMinutes * 60000);
+    
+    // Create re-export history
+    const exportHistory = new ExportHistory({
+      exportId: reExportId,
+      parentExportId: originalExport?.exportId || batch.batchId.replace('BATCH-', ''),
+      batchNumber: exportCount + 1,
+      exportDetails: {
+        totalOrders: orders.length,
+        totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
+        orderIds: orders.map(o => o._id),
+        exportMethod: 're-export',
+        triggerSource: 'admin_batches'
+      },
+      timestamps: {
+        exportedAt: new Date(),
+        estimatedCompletionTime: markAsSuccessful ? estimatedCompletionTime : null
+      },
+      status: {
+        current: markAsSuccessful ? 'processing' : 're-exported',
+        history: [{
+          status: markAsSuccessful ? 'processing' : 're-exported',
+          timestamp: new Date(),
+          message: markAsSuccessful ? 'Re-exported and sent to MTN' : 'Orders re-exported',
+          updatedBy: req.userId
+        }]
+      },
+      settingsUsed: {
+        settingName: exportSettings?.settingName || 'default',
+        totalProcessingMinutes: processingMinutes,
+        autoCompleteEnabled: exportSettings?.autoComplete?.enabled || false,
+        successRate: exportSettings?.autoComplete?.successRate || 95
+      },
+      exportedBy: req.userId
+    });
+    
+    await exportHistory.save({ session });
+    
+    // Update orders if marking as successful
+    if (markAsSuccessful) {
+      const bulkOps = orders.map(order => ({
+        updateOne: {
+          filter: { _id: order._id },
+          update: {
+            $set: {
+              status: 'sent',
+              exportedAt: new Date(),
+              'metadata.reExportId': reExportId,
+              'metadata.originalExportId': batch.batchId.replace('BATCH-', ''),
+              'metadata.estimatedCompletion': estimatedCompletionTime
+            }
+          }
+        }
+      }));
+      
+      await Transaction.bulkWrite(bulkOps, { session });
+    }
+    
+    // Create new batch record for re-export
+    await Batch.create([{
+      batchId: reBatchId,
+      parentBatchId: batch.batchId,
+      batchNumber: exportCount + 1,
+      exportedBy: req.userId,
+      exportDate: new Date(),
+      processingStatus: markAsSuccessful ? 'sent_to_third_party' : 're-exported',
+      orders: orders.map(o => ({
+        transactionId: o.transactionId,
+        beneficiaryNumber: o.dataDetails?.beneficiaryNumber,
+        capacity: o.dataDetails?.capacity,
+        amount: o.amount,
+        status: markAsSuccessful ? 'sent' : o.status,
+        userName: o.user?.fullName,
+        userId: o.user?._id
+      })),
+      stats: {
+        totalOrders: orders.length,
+        processedOrders: 0,
+        failedOrders: 0,
+        totalAmount: orders.reduce((sum, o) => sum + o.amount, 0)
+      }
+    }], { session });
+    
+    await session.commitTransaction();
+    transactionCommitted = true;
+    session.endSession();
+    
+    // Schedule auto-completion if needed
+    if (markAsSuccessful && exportSettings?.autoComplete?.enabled) {
+      scheduleAutoCompletion(reExportId, processingMinutes, exportSettings);
+    }
+    
+    // Generate Excel file - SAME FORMAT: Number and Capacity only
+    const workbook = XLSX.utils.book_new();
+    
+    // Main data sheet - ONLY NUMBER AND CAPACITY
+    const orderData = orders.map(o => ({
+      'Number': o.dataDetails?.beneficiaryNumber || '',
+      'Capacity': o.dataDetails?.capacity || ''
+    }));
+    
+    // Filter out any rows where either Number or Capacity is empty
+    const filteredOrderData = orderData.filter(row => 
+      row.Number && row.Capacity
+    );
+    
+    const orderSheet = XLSX.utils.json_to_sheet(filteredOrderData);
+    
+    // Set column widths
+    orderSheet['!cols'] = [
+      { wch: 15 }, // Number column
+      { wch: 15 }  // Capacity column
+    ];
+    
+    XLSX.utils.book_append_sheet(workbook, orderSheet, 'MTN_Orders');
+    
+    // Add summary sheet
+    const summaryData = [{
+      'Re-Export ID': reExportId,
+      'Original Batch': batch.batchId,
+      'Export Date': new Date().toLocaleString(),
+      'Total Orders': filteredOrderData.length,
+      'Status': markAsSuccessful ? 'Sent to MTN' : 'Re-Export Only'
+    }];
+    
+    const summarySheet = XLSX.utils.json_to_sheet(summaryData);
+    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
+    
+    // Generate Excel buffer
+    const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    
+    console.log(`✅ Re-export ${reExportId} completed with ${filteredOrderData.length} orders`);
+    
+    // Set response headers
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="MTN_re-export_${reExportId}.xlsx"`);
+    res.setHeader('X-Export-ID', reExportId);
+    
+    res.send(excelBuffer);
+    
+  } catch (error) {
+    if (!transactionCommitted) {
+      try {
+        await session.abortTransaction();
+      } catch (abortError) {
+        console.error('Error aborting transaction:', abortError);
+      }
+    }
+    
+    try {
+      session.endSession();
+    } catch (sessionError) {
+      console.error('Error ending session:', sessionError);
+    }
+    
+    console.error('Re-export error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error re-exporting batch',
+      error: error.message
+    });
+  }
+});
+
+// Get batch details for re-export preview
+router.get('/batches/:batchId/re-export-preview', async (req, res) => {
+  try {
+    const { batchId } = req.params;
+    
+    const batch = await Batch.findOne({ 
+      $or: [
+        { batchId: batchId },
+        { _id: batchId }
+      ]
+    }).populate('exportedBy', 'fullName');
+    
+    if (!batch) {
+      return res.status(404).json({
+        success: false,
+        message: 'Batch not found'
+      });
+    }
+    
+    // Get valid orders (with Number and Capacity)
+    const validOrders = batch.orders.filter(o => 
+      o.beneficiaryNumber && o.capacity
+    );
+    
+    res.json({
+      success: true,
+      data: {
+        batchId: batch.batchId,
+        originalExportDate: batch.exportDate,
+        originalExportedBy: batch.exportedBy?.fullName,
+        totalOrders: batch.orders.length,
+        validOrders: validOrders.length,
+        totalAmount: batch.stats.totalAmount,
+        currentStatus: batch.processingStatus,
+        orders: validOrders.slice(0, 10) // Preview first 10
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching re-export preview',
+      error: error.message
+    });
+  }
+});
+
 // Get system status
 router.get('/system-status', async (req, res) => {
   try {
