@@ -1277,78 +1277,140 @@ router.get('/transactions/:transactionId', async (req, res) => {
 
 // Bulk update order statuses with wallet operations
 router.post('/transactions/bulk-status-update', async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  const maxRetries = 3;
+  let retryCount = 0;
+  let lastError = null;
   
-  try {
-    const { transactionIds, status, reason } = req.body;
+  // Retry loop for transient transaction errors
+  while (retryCount < maxRetries) {
+    const session = await mongoose.startSession();
+    let transactionStarted = false;
     
-    if (!transactionIds || !Array.isArray(transactionIds) || transactionIds.length === 0) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: 'Transaction IDs array is required'
-      });
-    }
-    
-    if (!['pending', 'sent', 'successful', 'failed'].includes(status)) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid status. Must be pending, sent, successful, or failed'
-      });
-    }
-    
-    const results = {
-      updated: [],
-      failed: [],
-      errors: [],
-      walletOperations: {
-        charged: [],
-        refunded: [],
-        insufficientBalance: []
+    try {
+      const { transactionIds, status, reason } = req.body;
+      
+      // Input validation (only on first attempt)
+      if (retryCount === 0) {
+        if (!transactionIds || !Array.isArray(transactionIds) || transactionIds.length === 0) {
+          session.endSession();
+          return res.status(400).json({
+            success: false,
+            message: 'Transaction IDs array is required'
+          });
+        }
+        
+        if (!['pending', 'sent', 'successful', 'failed'].includes(status)) {
+          session.endSession();
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid status. Must be pending, sent, successful, or failed'
+          });
+        }
       }
-    };
-    
-    // Batch fetch all transactions first
-    const transactions = await Transaction.find({
-      $or: [
-        { _id: { $in: transactionIds } },
-        { transactionId: { $in: transactionIds } }
-      ]
-    }).session(session);
-    
-    // Map for quick lookup
-    const transactionMap = new Map();
-    transactions.forEach(t => {
-      transactionMap.set(t._id.toString(), t);
-      transactionMap.set(t.transactionId, t);
-    });
-    
-    // Process each transaction
-    for (const transactionId of transactionIds) {
-      try {
-        const transaction = transactionMap.get(transactionId);
+      
+      // Start transaction with read concern and write concern for better consistency
+      session.startTransaction({
+        readConcern: { level: "snapshot" },
+        writeConcern: { w: "majority" },
+        readPreference: "primary"
+      });
+      transactionStarted = true;
+      
+      const results = {
+        updated: [],
+        failed: [],
+        errors: [],
+        walletOperations: {
+          charged: [],
+          refunded: [],
+          insufficientBalance: []
+        }
+      };
+      
+      // Convert string IDs to ObjectIds for MongoDB query
+      const objectIds = [];
+      const stringIds = [];
+      
+      transactionIds.forEach(id => {
+        try {
+          if (mongoose.Types.ObjectId.isValid(id)) {
+            objectIds.push(new mongoose.Types.ObjectId(id));
+          }
+        } catch (e) {
+          // If it fails, it's not a valid ObjectId
+        }
+        stringIds.push(id);
+      });
+      
+      // Build query
+      const queryConditions = [];
+      if (objectIds.length > 0) {
+        queryConditions.push({ _id: { $in: objectIds } });
+      }
+      if (stringIds.length > 0) {
+        queryConditions.push({ transactionId: { $in: stringIds } });
+      }
+      
+      // Fetch all transactions ONCE at the beginning
+      const transactions = await Transaction.find({
+        $or: queryConditions
+      }).session(session);
+      
+      console.log(`Found ${transactions.length} transactions out of ${transactionIds.length} requested`);
+      
+      if (transactions.length === 0) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.json({
+          success: false,
+          message: 'No matching transactions found',
+          results: {
+            totalRequested: transactionIds.length,
+            successfullyUpdated: 0,
+            failed: transactionIds.length,
+            details: results
+          }
+        });
+      }
+      
+      // Create map for quick lookup
+      const transactionMap = new Map();
+      transactions.forEach(t => {
+        transactionMap.set(t._id.toString(), t);
+        transactionMap.set(t.transactionId, t);
+      });
+      
+      // Process each transaction
+      for (const id of transactionIds) {
+        let transaction = transactionMap.get(id);
         
         if (!transaction) {
-          results.failed.push(transactionId);
-          results.errors.push({ id: transactionId, error: 'Transaction not found' });
+          results.failed.push(id);
+          results.errors.push({ id: id, error: 'Transaction not found' });
           continue;
         }
         
         const oldStatus = transaction.status;
-        const user = await User.findById(transaction.user).session(session);
         
-        if (!user) {
-          results.failed.push(transactionId);
-          results.errors.push({ id: transactionId, error: 'User not found' });
+        // Skip if status is already the same
+        if (oldStatus === status) {
+          results.failed.push(id);
+          results.errors.push({ id: id, error: 'Status is already ' + status });
           continue;
         }
         
-        // Handle refunds for successful to failed transitions
+        // Get user - use findOne instead of findById to avoid potential conflicts
+        const user = await User.findOne({ _id: transaction.user }).session(session);
+        
+        if (!user) {
+          results.failed.push(id);
+          results.errors.push({ id: id, error: 'User not found' });
+          continue;
+        }
+        
+        // Handle wallet operations based on status transition
         if (oldStatus === 'successful' && status === 'failed') {
+          // Refund for successful -> failed
           const balanceBefore = user.wallet.balance;
           user.wallet.balance += transaction.amount;
           await user.save({ session });
@@ -1372,15 +1434,12 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
             amount: transaction.amount,
             newBalance: user.wallet.balance
           });
-        }
-        
-        // Handle charging user for failed to pending/sent transitions
-        if (oldStatus === 'failed' && (status === 'pending' || status === 'sent')) {
-          // Check if user has sufficient balance
+        } else if (oldStatus === 'failed' && (status === 'pending' || status === 'sent')) {
+          // Charge for failed -> pending/sent
           if (user.wallet.balance < transaction.amount) {
-            results.failed.push(transactionId);
+            results.failed.push(id);
             results.errors.push({ 
-              id: transactionId, 
+              id: id, 
               error: `Insufficient balance: needs GHS ${transaction.amount}, has GHS ${user.wallet.balance}` 
             });
             results.walletOperations.insufficientBalance.push({
@@ -1403,7 +1462,7 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
             amount: transaction.amount,
             balanceBefore: balanceBefore,
             balanceAfter: user.wallet.balance,
-            purpose: 'reprocess_charge',
+            purpose: 'purchase', // Changed from 'reprocess_charge' to 'purchase'
             reference: 'REPROCESS' + Date.now() + Math.random().toString(36).substr(2, 9),
             status: 'completed',
             description: `Charge for reprocessing transaction ${transaction.transactionId} (bulk update)`,
@@ -1464,53 +1523,82 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
           category: 'transaction',
           relatedTransaction: transaction._id
         }], { session });
+      }
+      
+      // Commit or abort based on results
+      if (results.updated.length > 0) {
+        await session.commitTransaction();
+        console.log(`Successfully updated ${results.updated.length} transactions`);
+      } else {
+        await session.abortTransaction();
+        console.log('No transactions were updated');
+      }
+      
+      session.endSession();
+      
+      // Calculate financial summary
+      const financialSummary = {
+        totalCharged: results.walletOperations.charged.reduce((sum, op) => sum + op.amount, 0),
+        totalRefunded: results.walletOperations.refunded.reduce((sum, op) => sum + op.amount, 0),
+        usersCharged: results.walletOperations.charged.length,
+        usersRefunded: results.walletOperations.refunded.length,
+        insufficientBalanceCount: results.walletOperations.insufficientBalance.length
+      };
+      
+      // Success - return results
+      return res.json({
+        success: results.updated.length > 0,
+        message: results.updated.length > 0 
+          ? `Successfully updated ${results.updated.length} transaction(s)` 
+          : 'No transactions were updated',
+        results: {
+          totalRequested: transactionIds.length,
+          successfullyUpdated: results.updated.length,
+          failed: results.failed.length,
+          details: results,
+          financialSummary
+        }
+      });
+      
+    } catch (error) {
+      console.error(`Bulk update error (attempt ${retryCount + 1}):`, error);
+      lastError = error;
+      
+      if (transactionStarted) {
+        try {
+          await session.abortTransaction();
+        } catch (abortError) {
+          console.error('Error aborting transaction:', abortError);
+        }
+      }
+      
+      session.endSession();
+      
+      // Check if it's a transient error that should be retried
+      if (error.hasErrorLabel && error.hasErrorLabel('TransientTransactionError')) {
+        retryCount++;
+        console.log(`Retrying transaction (attempt ${retryCount}/${maxRetries})...`);
         
-      } catch (error) {
-        results.failed.push(transactionId);
-        results.errors.push({ id: transactionId, error: error.message });
+        // Add a small delay before retry
+        await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
+        continue; // Retry the transaction
       }
+      
+      // Non-transient error or final attempt - return error
+      return res.status(500).json({
+        success: false,
+        message: 'Error in bulk status update',
+        error: lastError.message
+      });
     }
-    
-    // Commit transaction if at least one update was successful
-    if (results.updated.length > 0) {
-      await session.commitTransaction();
-    } else {
-      await session.abortTransaction();
-    }
-    
-    session.endSession();
-    
-    // Calculate financial summary
-    const financialSummary = {
-      totalCharged: results.walletOperations.charged.reduce((sum, op) => sum + op.amount, 0),
-      totalRefunded: results.walletOperations.refunded.reduce((sum, op) => sum + op.amount, 0),
-      usersCharged: results.walletOperations.charged.length,
-      usersRefunded: results.walletOperations.refunded.length,
-      insufficientBalanceCount: results.walletOperations.insufficientBalance.length
-    };
-    
-    res.json({
-      success: true,
-      message: `Bulk status update completed`,
-      results: {
-        totalRequested: transactionIds.length,
-        successfullyUpdated: results.updated.length,
-        failed: results.failed.length,
-        details: results,
-        financialSummary
-      }
-    });
-    
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    
-    res.status(500).json({
-      success: false,
-      message: 'Error in bulk status update',
-      error: error.message
-    });
   }
+  
+  // If we've exhausted all retries
+  res.status(500).json({
+    success: false,
+    message: 'Error in bulk status update after multiple retries',
+    error: lastError ? lastError.message : 'Unknown error'
+  });
 });
 
 // Alternative: Bulk reprocess failed transactions (specific endpoint)
