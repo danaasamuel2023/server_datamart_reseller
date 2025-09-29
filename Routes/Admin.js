@@ -2473,13 +2473,18 @@ router.get('/system-status', async (req, res) => {
   }
 });
 
-// Preview export with impact analysis
+// =============================================
+// UPDATED EXPORT ROUTES WITH 40 ORDER LIMIT
+// =============================================
+
+// 1. Preview export - Updated with 40 order limit
 router.post('/orders/export/preview', async (req, res) => {
   try {
     const { 
       startDate, 
       endDate, 
-      status = 'pending'
+      status = 'pending',
+      page = 1
     } = req.body;
     
     const filter = {
@@ -2493,14 +2498,21 @@ router.post('/orders/export/preview', async (req, res) => {
       if (endDate) filter.createdAt.$lte = new Date(endDate);
     }
     
+    // Get total count
+    const totalCount = await Transaction.countDocuments(filter);
+    const ordersPerBatch = 40;
+    const totalBatches = Math.ceil(totalCount / ordersPerBatch);
+    
+    // Fetch only 40 orders for preview
     const orders = await Transaction.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(100)
+      .sort({ createdAt: 1 }) // FIFO - oldest first
+      .skip((page - 1) * ordersPerBatch)
+      .limit(ordersPerBatch) // Fixed 40 limit
       .populate('dataDetails.product', 'name capacity')
       .populate('user', 'fullName wallet')
       .lean();
     
-    // Get active settings to show processing time
+    // Get active settings
     const activeSettings = await ExportSettings.findOne({ isActive: true });
     
     const exportData = orders.map(order => ({
@@ -2516,17 +2528,29 @@ router.post('/orders/export/preview', async (req, res) => {
     const impactSummary = {
       totalOrdersToExport: exportData.length,
       totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
-      estimatedProcessingTime: activeSettings?.autoComplete?.fixedTimeMinutes || activeSettings?.timeSettings?.totalProcessingMinutes || 30,
+      estimatedProcessingTime: activeSettings?.autoComplete?.fixedTimeMinutes || 30,
       autoCompleteEnabled: activeSettings?.autoComplete?.enabled || false,
-      successRate: activeSettings?.autoComplete?.successRate || 95
+      successRate: activeSettings?.autoComplete?.successRate || 95,
+      currentBatch: page,
+      totalBatches: totalBatches,
+      totalAvailableOrders: totalCount,
+      remainingOrders: Math.max(0, totalCount - (page * ordersPerBatch))
     };
     
     res.json({
       success: true,
-      message: `Found ${exportData.length} orders ready for export`,
+      message: `Found ${exportData.length} orders for batch ${page} of ${totalBatches} (${totalCount} total available)`,
       data: exportData,
       count: exportData.length,
-      impactSummary
+      impactSummary,
+      pagination: {
+        currentPage: page,
+        totalPages: totalBatches,
+        totalOrders: totalCount,
+        ordersInThisBatch: exportData.length,
+        hasNextBatch: page < totalBatches,
+        remainingOrders: Math.max(0, totalCount - (page * ordersPerBatch))
+      }
     });
   } catch (error) {
     res.status(500).json({
@@ -2537,8 +2561,7 @@ router.post('/orders/export/preview', async (req, res) => {
   }
 });
 
-// MAIN EXPORT ROUTE - FIXED VERSION
-// MAIN EXPORT ROUTE - FIXED VERSION (Number and Numeric Capacity Only)
+// 2. Main Export Route - Updated with 40 order limit
 router.post('/orders/export/excel', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -2550,8 +2573,12 @@ router.post('/orders/export/excel', async (req, res) => {
       startDate, 
       endDate, 
       status = 'pending',
-      markAsSuccessful = false
+      markAsSuccessful = false,
+      page = 1 // Support pagination for multiple batches
     } = req.body;
+    
+    // Fixed limit of 40 orders per export
+    const ORDERS_PER_BATCH = 40;
     
     // Get active export settings
     let exportSettings = await ExportSettings.findOne({ isActive: true });
@@ -2582,10 +2609,30 @@ router.post('/orders/export/excel', async (req, res) => {
       if (endDate) filter.createdAt.$lte = new Date(endDate);
     }
     
-    // Fetch orders
+    // Get total count for pagination info
+    const totalAvailable = await Transaction.countDocuments(filter);
+    const totalBatches = Math.ceil(totalAvailable / ORDERS_PER_BATCH);
+    
+    // Validate page number
+    if (page > totalBatches) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: `No orders available for page ${page}. Total batches available: ${totalBatches}`,
+        info: {
+          totalAvailable,
+          totalBatches,
+          ordersPerBatch: ORDERS_PER_BATCH
+        }
+      });
+    }
+    
+    // Fetch exactly 40 orders (or less for last batch)
     const orders = await Transaction.find(filter)
-      .sort({ createdAt: -1 })
-      .limit(100)
+      .sort({ createdAt: 1 }) // FIFO - oldest first
+      .skip((page - 1) * ORDERS_PER_BATCH)
+      .limit(ORDERS_PER_BATCH)
       .populate('dataDetails.product', 'name capacity')
       .populate('user', 'fullName phone wallet')
       .session(session);
@@ -2595,7 +2642,12 @@ router.post('/orders/export/excel', async (req, res) => {
       session.endSession();
       return res.status(404).json({
         success: false,
-        message: 'No orders found for export'
+        message: 'No orders found for export',
+        info: {
+          totalAvailable,
+          page,
+          ordersPerBatch: ORDERS_PER_BATCH
+        }
       });
     }
     
@@ -2607,7 +2659,7 @@ router.post('/orders/export/excel', async (req, res) => {
     const processingMinutes = exportSettings.autoComplete?.fixedTimeMinutes || 30;
     const estimatedCompletionTime = new Date(Date.now() + processingMinutes * 60000);
     
-    // Create export history
+    // Create export history with batch info
     const exportHistory = new ExportHistory({
       exportId,
       batchNumber: exportCount + 1,
@@ -2616,7 +2668,14 @@ router.post('/orders/export/excel', async (req, res) => {
         totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
         orderIds: orders.map(o => o._id),
         exportMethod: 'manual',
-        triggerSource: 'admin_dashboard'
+        triggerSource: 'admin_dashboard',
+        metadata: {
+          batchPage: page,
+          totalBatches: totalBatches,
+          ordersPerBatch: ORDERS_PER_BATCH,
+          totalAvailableOrders: totalAvailable,
+          remainingOrders: Math.max(0, totalAvailable - (page * ORDERS_PER_BATCH))
+        }
       },
       timestamps: {
         exportedAt: new Date(),
@@ -2633,7 +2692,9 @@ router.post('/orders/export/excel', async (req, res) => {
         history: [{
           status: markAsSuccessful ? 'processing' : 'exported',
           timestamp: new Date(),
-          message: markAsSuccessful ? 'Orders sent to MTN for processing' : 'Orders exported',
+          message: markAsSuccessful 
+            ? `Batch ${page} of ${totalBatches} sent to MTN (${orders.length} orders)`
+            : `Batch ${page} of ${totalBatches} exported (${orders.length} orders)`,
           updatedBy: req.userId
         }]
       },
@@ -2660,6 +2721,7 @@ router.post('/orders/export/excel', async (req, res) => {
               exportedAt: new Date(),
               'metadata.exportId': exportId,
               'metadata.batchId': batchId,
+              'metadata.batchPage': page,
               'metadata.estimatedCompletion': estimatedCompletionTime,
               'metadata.processingMinutes': processingMinutes
             }
@@ -2670,7 +2732,7 @@ router.post('/orders/export/excel', async (req, res) => {
       await Transaction.bulkWrite(bulkOps, { session });
     }
     
-    // Update system status
+    // Update system status with batch info
     await SystemStatus.findOneAndUpdate(
       { _id: 'current_status' },
       {
@@ -2682,8 +2744,15 @@ router.post('/orders/export/excel', async (req, res) => {
             status: markAsSuccessful ? 'processing' : 'exported',
             exportedBy: req.userId,
             processingMinutes: markAsSuccessful ? processingMinutes : 0,
-            completedAt: null
+            completedAt: null,
+            batchInfo: {
+              currentBatch: page,
+              totalBatches: totalBatches,
+              totalAvailable: totalAvailable,
+              remainingOrders: Math.max(0, totalAvailable - (page * ORDERS_PER_BATCH))
+            }
           },
+          lastExportDisplay: `Batch ${page}/${totalBatches} - ${orders.length} orders`,
           'currentProcessing.isProcessing': markAsSuccessful,
           'currentProcessing.activeExports': markAsSuccessful ? [{
             exportId,
@@ -2691,7 +2760,8 @@ router.post('/orders/export/excel', async (req, res) => {
             estimatedCompletion: estimatedCompletionTime,
             processingMinutes,
             progress: 0,
-            orderCount: orders.length
+            orderCount: orders.length,
+            batchInfo: `Batch ${page}/${totalBatches}`
           }] : [],
           'statistics.today.lastUpdated': new Date()
         },
@@ -2710,6 +2780,14 @@ router.post('/orders/export/excel', async (req, res) => {
       exportedBy: req.userId,
       exportDate: new Date(),
       processingStatus: markAsSuccessful ? 'sent_to_third_party' : 'exported',
+      status: markAsSuccessful ? 'processing' : 'exported',
+      metadata: {
+        batchPage: page,
+        totalBatches: totalBatches,
+        ordersPerBatch: ORDERS_PER_BATCH,
+        isPartialBatch: orders.length < ORDERS_PER_BATCH,
+        hasMoreBatches: page < totalBatches
+      },
       orders: orders.map(o => ({
         transactionId: o.transactionId,
         beneficiaryNumber: o.dataDetails?.beneficiaryNumber,
@@ -2741,20 +2819,20 @@ router.post('/orders/export/excel', async (req, res) => {
       user: msg.userId,
       title: markAsSuccessful ? 'Orders Sent for Processing' : 'Orders Exported',
       message: markAsSuccessful 
-        ? `${msg.orderCount} order(s) sent to MTN for processing. Estimated completion in ${processingMinutes} minutes.`
-        : `${msg.orderCount} order(s) exported successfully.`,
+        ? `${msg.orderCount} order(s) sent to MTN (Batch ${page}/${totalBatches}). Estimated completion in ${processingMinutes} minutes.`
+        : `${msg.orderCount} order(s) exported successfully (Batch ${page}/${totalBatches}).`,
       type: 'info',
       category: 'transaction'
     }));
     
     await Notification.insertMany(notifications, { session });
     
-    // COMMIT TRANSACTION HERE
+    // Commit transaction
     await session.commitTransaction();
     transactionCommitted = true;
     session.endSession();
     
-    // Schedule auto-completion AFTER transaction is committed
+    // Schedule auto-completion if needed
     if (markAsSuccessful && exportSettings.autoComplete?.enabled) {
       try {
         scheduleAutoCompletion(exportId, processingMinutes, exportSettings);
@@ -2763,15 +2841,13 @@ router.post('/orders/export/excel', async (req, res) => {
       }
     }
     
-    // Generate Excel file - WITH NUMERIC CAPACITY ONLY
+    // Generate Excel file
     const workbook = XLSX.utils.book_new();
     
-    // Main data sheet - NUMBER AND NUMERIC CAPACITY
+    // Main data sheet
     const orderData = orders.map(o => {
-      // Extract numeric value from capacity (remove GB, MB, etc.)
       let capacityValue = o.dataDetails?.capacity || '';
       if (typeof capacityValue === 'string') {
-        // Extract only numbers and decimal points from the capacity string
         capacityValue = capacityValue.replace(/[^0-9.]/g, '');
       }
       
@@ -2781,46 +2857,48 @@ router.post('/orders/export/excel', async (req, res) => {
       };
     });
     
-    // Filter out any rows where either Number or Capacity is empty
     const filteredOrderData = orderData.filter(row => 
       row.Number && row.Capacity
     );
     
     const orderSheet = XLSX.utils.json_to_sheet(filteredOrderData);
-    
-    // Set column widths for better readability
     orderSheet['!cols'] = [
-      { wch: 15 }, // Number column
-      { wch: 15 }  // Capacity column
+      { wch: 15 }, 
+      { wch: 15 }
     ];
     
     XLSX.utils.book_append_sheet(workbook, orderSheet, 'MTN_Orders');
     
-    // Optional: Add a summary sheet with metadata
+    // Summary sheet with batch information
     const summaryData = [{
       'Export ID': exportId,
+      'Batch Number': `${page} of ${totalBatches}`,
       'Export Date': new Date().toLocaleString(),
-      'Total Orders': filteredOrderData.length,
+      'Orders in This Batch': filteredOrderData.length,
+      'Total Available Orders': totalAvailable,
+      'Remaining Orders': Math.max(0, totalAvailable - (page * ORDERS_PER_BATCH)),
+      'Has More Batches': page < totalBatches ? 'Yes' : 'No',
       'Status': markAsSuccessful ? 'Sent to MTN' : 'Export Only'
     }];
     
     const summarySheet = XLSX.utils.json_to_sheet(summaryData);
     XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
     
-    // Generate Excel buffer
     const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
     
-    console.log(`✅ Export ${exportId} completed successfully with ${filteredOrderData.length} valid orders`);
+    console.log(`✅ Export ${exportId} - Batch ${page}/${totalBatches} completed with ${filteredOrderData.length} orders (${Math.max(0, totalAvailable - (page * ORDERS_PER_BATCH))} remaining)`);
     
     // Set response headers
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="MTN_export_${exportId}.xlsx"`);
+    res.setHeader('Content-Disposition', `attachment; filename="MTN_export_${exportId}_batch${page}.xlsx"`);
     res.setHeader('X-Export-ID', exportId);
+    res.setHeader('X-Batch-Page', page);
+    res.setHeader('X-Total-Batches', totalBatches);
+    res.setHeader('X-Remaining-Orders', Math.max(0, totalAvailable - (page * ORDERS_PER_BATCH)));
     
     res.send(excelBuffer);
     
   } catch (error) {
-    // Only abort if not committed
     if (!transactionCommitted) {
       try {
         await session.abortTransaction();
@@ -2843,53 +2921,322 @@ router.post('/orders/export/excel', async (req, res) => {
     });
   }
 });
-// Check export status
-router.get('/export-status/:exportId', async (req, res) => {
+
+// 3. Re-export preview - Updated with 40 order limit
+router.get('/batches/:batchId/re-export-preview', async (req, res) => {
   try {
-    const { exportId } = req.params;
+    const { batchId } = req.params;
     
-    const exportHistory = await ExportHistory.findOne({ exportId })
-      .populate('exportedBy', 'fullName');
+    const batch = await Batch.findOne({ 
+      $or: [
+        { batchId: batchId },
+        { _id: batchId }
+      ]
+    });
     
-    if (!exportHistory) {
+    if (!batch) {
       return res.status(404).json({
         success: false,
-        message: 'Export not found'
+        message: 'Batch not found'
       });
     }
     
-    // Calculate progress
-    const elapsed = Date.now() - exportHistory.timestamps.exportedAt;
-    const elapsedMinutes = Math.floor(elapsed / 60000);
-    const totalMinutes = exportHistory.settingsUsed.totalProcessingMinutes;
-    const progress = Math.min(100, Math.round((elapsedMinutes / totalMinutes) * 100));
+    // Limit orders to 40 for re-export
+    const ordersToReExport = batch.orders.slice(0, 40);
+    const totalAmount = ordersToReExport.reduce((sum, o) => sum + o.amount, 0);
     
     res.json({
       success: true,
       data: {
-        exportId: exportHistory.exportId,
-        status: exportHistory.status.current,
-        progress,
-        elapsedMinutes,
-        estimatedRemainingMinutes: Math.max(0, totalMinutes - elapsedMinutes),
-        statistics: {
-          totalOrders: exportHistory.exportDetails.totalOrders,
-          successCount: exportHistory.status.successCount || 0,
-          failedCount: exportHistory.status.failedCount || 0
-        },
-        timestamps: exportHistory.timestamps,
-        exportedBy: exportHistory.exportedBy?.fullName
+        batchId: batch.batchId,
+        originalExportDate: batch.exportDate,
+        validOrders: ordersToReExport.length,
+        totalOrders: batch.orders.length,
+        totalAmount: totalAmount,
+        orders: ordersToReExport.slice(0, 10), // Preview first 10
+        hasMoreThan40: batch.orders.length > 40,
+        message: batch.orders.length > 40 
+          ? `Note: Only the first 40 orders will be re-exported (${batch.orders.length - 40} will be excluded)`
+          : null
       }
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: 'Error fetching export status',
+      message: 'Error previewing re-export',
       error: error.message
     });
   }
 });
 
+// 4. Re-export orders - Updated with 40 order limit
+router.post('/batches/:batchId/re-export', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  let transactionCommitted = false;
+  
+  try {
+    const { batchId } = req.params;
+    const { markAsSuccessful = false } = req.body;
+    
+    // Find the batch
+    const batch = await Batch.findOne({ 
+      $or: [
+        { batchId: batchId },
+        { _id: batchId }
+      ]
+    }).populate('exportedBy', 'fullName');
+    
+    if (!batch) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'Batch not found'
+      });
+    }
+    
+    // Limit to 40 orders for re-export
+    const orderIdsToProcess = batch.orders.slice(0, 40).map(o => o.transactionId);
+    
+    // Fetch the transactions
+    const orders = await Transaction.find({
+      transactionId: { $in: orderIdsToProcess }
+    })
+    .populate('dataDetails.product', 'name capacity')
+    .populate('user', 'fullName phone wallet')
+    .session(session);
+    
+    if (orders.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'No orders found for re-export'
+      });
+    }
+    
+    // Generate new re-export ID
+    const exportCount = await ExportHistory.countDocuments();
+    const reExportId = `RE-EXP-${Date.now()}-${String(exportCount + 1).padStart(4, '0')}`;
+    const reBatchId = `BATCH-${reExportId}`;
+    
+    // Get export settings
+    let exportSettings = await ExportSettings.findOne({ isActive: true });
+    if (!exportSettings) {
+      exportSettings = await ExportSettings.findOne({ settingName: 'default' });
+    }
+    
+    const processingMinutes = exportSettings?.autoComplete?.fixedTimeMinutes || 30;
+    const estimatedCompletionTime = new Date(Date.now() + processingMinutes * 60000);
+    
+    // Create re-export history
+    const exportHistory = new ExportHistory({
+      exportId: reExportId,
+      batchNumber: exportCount + 1,
+      exportDetails: {
+        totalOrders: orders.length,
+        totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
+        orderIds: orders.map(o => o._id),
+        exportMethod: 'manual',
+        triggerSource: 'admin_dashboard',
+        metadata: {
+          isReExport: true,
+          originalBatchId: batch.batchId,
+          limitedTo40: batch.orders.length > 40,
+          excludedOrders: Math.max(0, batch.orders.length - 40)
+        }
+      },
+      timestamps: {
+        exportedAt: new Date(),
+        estimatedCompletionTime: markAsSuccessful ? estimatedCompletionTime : null
+      },
+      status: {
+        current: markAsSuccessful ? 'processing' : 're-export',
+        history: [{
+          status: markAsSuccessful ? 'processing' : 're-export',
+          timestamp: new Date(),
+          message: markAsSuccessful 
+            ? `Re-exported ${orders.length} orders to MTN (max 40 limit applied)`
+            : `${orders.length} orders re-exported`,
+          updatedBy: req.userId
+        }]
+      },
+      settingsUsed: {
+        settingName: exportSettings?.settingName || 'default',
+        totalProcessingMinutes: processingMinutes,
+        autoCompleteEnabled: exportSettings?.autoComplete?.enabled || false,
+        successRate: exportSettings?.autoComplete?.successRate || 95
+      },
+      exportedBy: req.userId
+    });
+    
+    await exportHistory.save({ session });
+    
+    // Update orders if marking as successful
+    if (markAsSuccessful) {
+      const bulkOps = orders.map(order => ({
+        updateOne: {
+          filter: { _id: order._id },
+          update: {
+            $set: {
+              status: 'sent',
+              exportedAt: new Date(),
+              'metadata.exportId': reExportId,
+              'metadata.batchId': reBatchId,
+              'metadata.estimatedCompletion': estimatedCompletionTime,
+              'metadata.processingMinutes': processingMinutes,
+              'metadata.isReExport': true
+            }
+          }
+        }
+      }));
+      
+      await Transaction.bulkWrite(bulkOps, { session });
+    }
+    
+    // Update system status
+    await SystemStatus.findOneAndUpdate(
+      { _id: 'current_status' },
+      {
+        $set: {
+          lastExport: {
+            exportId: reExportId,
+            exportedAt: new Date(),
+            totalOrders: orders.length,
+            status: markAsSuccessful ? 'processing' : 're-export',
+            exportedBy: req.userId,
+            processingMinutes: markAsSuccessful ? processingMinutes : 0,
+            completedAt: null
+          },
+          'currentProcessing.isProcessing': markAsSuccessful,
+          'currentProcessing.activeExports': markAsSuccessful ? [{
+            exportId: reExportId,
+            startedAt: new Date(),
+            estimatedCompletion: estimatedCompletionTime,
+            processingMinutes,
+            progress: 0,
+            orderCount: orders.length
+          }] : []
+        }
+      },
+      { session }
+    );
+    
+    // Create new batch record
+    await Batch.create([{
+      batchId: reBatchId,
+      batchNumber: exportCount + 1,
+      exportedBy: req.userId,
+      exportDate: new Date(),
+      processingStatus: markAsSuccessful ? 'sent_to_third_party' : 're-exported',
+      status: markAsSuccessful ? 'processing' : 'exported',
+      metadata: {
+        isReExport: true,
+        originalBatchId: batch.batchId,
+        limitApplied: batch.orders.length > 40
+      },
+      orders: orders.map(o => ({
+        transactionId: o.transactionId,
+        beneficiaryNumber: o.dataDetails?.beneficiaryNumber,
+        capacity: o.dataDetails?.capacity,
+        amount: o.amount,
+        status: markAsSuccessful ? 'sent' : o.status,
+        userName: o.user?.fullName,
+        userId: o.user?._id
+      })),
+      stats: {
+        totalOrders: orders.length,
+        processedOrders: 0,
+        failedOrders: 0,
+        totalAmount: orders.reduce((sum, o) => sum + o.amount, 0)
+      }
+    }], { session });
+    
+    await session.commitTransaction();
+    transactionCommitted = true;
+    session.endSession();
+    
+    // Schedule auto-completion if needed
+    if (markAsSuccessful && exportSettings?.autoComplete?.enabled) {
+      scheduleAutoCompletion(reExportId, processingMinutes, exportSettings);
+    }
+    
+    // Generate Excel file
+    const workbook = XLSX.utils.book_new();
+    
+    const orderData = orders.map(o => {
+      let capacityValue = o.dataDetails?.capacity || '';
+      if (typeof capacityValue === 'string') {
+        capacityValue = capacityValue.replace(/[^0-9.]/g, '');
+      }
+      
+      return {
+        'Number': o.dataDetails?.beneficiaryNumber || '',
+        'Capacity': capacityValue
+      };
+    });
+    
+    const filteredOrderData = orderData.filter(row => 
+      row.Number && row.Capacity
+    );
+    
+    const orderSheet = XLSX.utils.json_to_sheet(filteredOrderData);
+    orderSheet['!cols'] = [
+      { wch: 15 },
+      { wch: 15 }
+    ];
+    
+    XLSX.utils.book_append_sheet(workbook, orderSheet, 'MTN_Orders');
+    
+    // Add summary
+    const summaryData = [{
+      'Re-Export ID': reExportId,
+      'Original Batch': batch.batchId,
+      'Export Date': new Date().toLocaleString(),
+      'Total Orders': filteredOrderData.length,
+      'Note': batch.orders.length > 40 ? `Limited to 40 orders (${batch.orders.length - 40} excluded)` : 'All orders included',
+      'Status': markAsSuccessful ? 'Sent to MTN' : 'Re-Export Only'
+    }];
+    
+    const summarySheet = XLSX.utils.json_to_sheet(summaryData);
+    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
+    
+    const excelBuffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    
+    console.log(`✅ Re-export ${reExportId} completed with ${filteredOrderData.length} orders (40 limit applied)`);
+    
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="MTN_re-export_${reExportId}.xlsx"`);
+    res.setHeader('X-Export-ID', reExportId);
+    res.setHeader('X-Orders-Count', filteredOrderData.length);
+    
+    res.send(excelBuffer);
+    
+  } catch (error) {
+    if (!transactionCommitted) {
+      try {
+        await session.abortTransaction();
+      } catch (abortError) {
+        console.error('Error aborting transaction:', abortError);
+      }
+    }
+    
+    try {
+      session.endSession();
+    } catch (sessionError) {
+      console.error('Error ending session:', sessionError);
+    }
+    
+    console.error('Re-export error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error re-exporting batch',
+      error: error.message
+    });
+  }
+});
 // =============================================
 // 7. WALLET MANAGEMENT APIs (continued...)
 // =============================================
