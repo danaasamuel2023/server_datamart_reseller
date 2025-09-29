@@ -1275,174 +1275,17 @@ router.get('/transactions/:transactionId', async (req, res) => {
   }
 });
 
-// Update order status (now with 'sent' status support)
-router.patch('/transactions/:transactionId/status', async (req, res) => {
-  try {
-    const { transactionId } = req.params;
-    const { status, reason } = req.body;
-    
-    if (!['pending', 'sent', 'successful', 'failed'].includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid status. Must be pending, sent, successful, or failed'
-      });
-    }
-    
-    const transaction = await Transaction.findOne({
-      $or: [
-        { _id: transactionId },
-        { transactionId: transactionId }
-      ]
-    });
-    
-    if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transaction not found'
-      });
-    }
-    
-    const oldStatus = transaction.status;
-    
-    // Handle refunds for failed transactions
-    if (oldStatus === 'successful' && status === 'failed') {
-      const user = await User.findById(transaction.user);
-      if (user) {
-        const balanceBefore = user.wallet.balance;
-        user.wallet.balance += transaction.amount;
-        await user.save();
-        
-        await WalletTransaction.create({
-          user: transaction.user,
-          type: 'credit',
-          amount: transaction.amount,
-          balanceBefore: balanceBefore,
-          balanceAfter: user.wallet.balance,
-          purpose: 'refund',
-          reference: 'REF' + Date.now(),
-          status: 'completed',
-          description: `Refund for failed transaction ${transaction.transactionId}`
-        });
-      }
-    }
-    
-    transaction.status = status;
-    transaction.statusUpdatedBy = req.userId;
-    transaction.statusUpdatedAt = new Date();
-    if (status === 'successful') {
-      transaction.completedAt = new Date();
-    }
-    if (reason) {
-      transaction.statusUpdateReason = reason;
-    }
-    await transaction.save();
-    
-    await Notification.create({
-      user: transaction.user,
-      title: 'Order Status Updated',
-      message: `Your order ${transaction.transactionId} status has been updated to ${status}. ${reason || ''}`,
-      type: status === 'successful' ? 'success' : status === 'failed' ? 'error' : 'info',
-      category: 'transaction',
-      relatedTransaction: transaction._id
-    });
-    
-    res.json({
-      success: true,
-      message: `Transaction status updated to ${status}`,
-      data: {
-        transactionId: transaction.transactionId,
-        oldStatus,
-        newStatus: status,
-        updatedBy: req.user.fullName
-      }
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error updating transaction status',
-      error: error.message
-    });
-  }
-});
-
-// Reverse/Refund transaction
-router.post('/transactions/:transactionId/reverse', async (req, res) => {
-  try {
-    const { transactionId } = req.params;
-    const { reason } = req.body;
-    
-    const transaction = await Transaction.findOne({
-      $or: [
-        { _id: transactionId },
-        { transactionId: transactionId }
-      ]
-    });
-    
-    if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transaction not found'
-      });
-    }
-    
-    if (transaction.status !== 'successful') {
-      return res.status(400).json({
-        success: false,
-        message: 'Only successful transactions can be reversed'
-      });
-    }
-    
-    const user = await User.findById(transaction.user);
-    user.wallet.balance += transaction.amount;
-    await user.save();
-    
-    transaction.status = 'reversed';
-    transaction.reversedAt = new Date();
-    transaction.reversedBy = req.userId;
-    transaction.notes = reason;
-    await transaction.save();
-    
-    await WalletTransaction.create({
-      user: transaction.user,
-      type: 'credit',
-      amount: transaction.amount,
-      balanceBefore: user.wallet.balance - transaction.amount,
-      balanceAfter: user.wallet.balance,
-      purpose: 'refund',
-      reference: 'REF' + Date.now(),
-      status: 'completed',
-      description: `Refund for transaction ${transaction.transactionId}`
-    });
-    
-    await Notification.create({
-      user: transaction.user,
-      title: 'Transaction Refunded',
-      message: `Your transaction ${transaction.transactionId} has been refunded. Amount: GHS ${transaction.amount}`,
-      type: 'success',
-      category: 'transaction',
-      relatedTransaction: transaction._id
-    });
-    
-    res.json({
-      success: true,
-      message: 'Transaction reversed successfully',
-      data: transaction
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Error reversing transaction',
-      error: error.message
-    });
-  }
-});
-
-// Bulk update order statuses
+// Bulk update order statuses with wallet operations
 router.post('/transactions/bulk-status-update', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const { transactionIds, status, reason } = req.body;
     
     if (!transactionIds || !Array.isArray(transactionIds) || transactionIds.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
         message: 'Transaction IDs array is required'
@@ -1450,47 +1293,201 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
     }
     
     if (!['pending', 'sent', 'successful', 'failed'].includes(status)) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({
         success: false,
-        message: 'Invalid status'
+        message: 'Invalid status. Must be pending, sent, successful, or failed'
       });
     }
     
     const results = {
       updated: [],
       failed: [],
-      errors: []
+      errors: [],
+      walletOperations: {
+        charged: [],
+        refunded: [],
+        insufficientBalance: []
+      }
     };
     
+    // Batch fetch all transactions first
+    const transactions = await Transaction.find({
+      $or: [
+        { _id: { $in: transactionIds } },
+        { transactionId: { $in: transactionIds } }
+      ]
+    }).session(session);
+    
+    // Map for quick lookup
+    const transactionMap = new Map();
+    transactions.forEach(t => {
+      transactionMap.set(t._id.toString(), t);
+      transactionMap.set(t.transactionId, t);
+    });
+    
+    // Process each transaction
     for (const transactionId of transactionIds) {
       try {
-        const transaction = await Transaction.findOne({
-          $or: [
-            { _id: transactionId },
-            { transactionId: transactionId }
-          ]
-        });
+        const transaction = transactionMap.get(transactionId);
         
         if (!transaction) {
           results.failed.push(transactionId);
-          results.errors.push({ id: transactionId, error: 'Not found' });
+          results.errors.push({ id: transactionId, error: 'Transaction not found' });
           continue;
         }
         
+        const oldStatus = transaction.status;
+        const user = await User.findById(transaction.user).session(session);
+        
+        if (!user) {
+          results.failed.push(transactionId);
+          results.errors.push({ id: transactionId, error: 'User not found' });
+          continue;
+        }
+        
+        // Handle refunds for successful to failed transitions
+        if (oldStatus === 'successful' && status === 'failed') {
+          const balanceBefore = user.wallet.balance;
+          user.wallet.balance += transaction.amount;
+          await user.save({ session });
+          
+          await WalletTransaction.create([{
+            user: transaction.user,
+            type: 'credit',
+            amount: transaction.amount,
+            balanceBefore: balanceBefore,
+            balanceAfter: user.wallet.balance,
+            purpose: 'refund',
+            reference: 'REF' + Date.now() + Math.random().toString(36).substr(2, 9),
+            status: 'completed',
+            description: `Refund for failed transaction ${transaction.transactionId} (bulk update)`,
+            relatedTransaction: transaction._id
+          }], { session });
+          
+          results.walletOperations.refunded.push({
+            transactionId: transaction.transactionId,
+            userId: user._id,
+            amount: transaction.amount,
+            newBalance: user.wallet.balance
+          });
+        }
+        
+        // Handle charging user for failed to pending/sent transitions
+        if (oldStatus === 'failed' && (status === 'pending' || status === 'sent')) {
+          // Check if user has sufficient balance
+          if (user.wallet.balance < transaction.amount) {
+            results.failed.push(transactionId);
+            results.errors.push({ 
+              id: transactionId, 
+              error: `Insufficient balance: needs GHS ${transaction.amount}, has GHS ${user.wallet.balance}` 
+            });
+            results.walletOperations.insufficientBalance.push({
+              transactionId: transaction.transactionId,
+              userId: user._id,
+              userName: user.fullName,
+              required: transaction.amount,
+              available: user.wallet.balance
+            });
+            continue; // Skip this transaction
+          }
+          
+          const balanceBefore = user.wallet.balance;
+          user.wallet.balance -= transaction.amount;
+          await user.save({ session });
+          
+          await WalletTransaction.create([{
+            user: transaction.user,
+            type: 'debit',
+            amount: transaction.amount,
+            balanceBefore: balanceBefore,
+            balanceAfter: user.wallet.balance,
+            purpose: 'reprocess_charge',
+            reference: 'REPROCESS' + Date.now() + Math.random().toString(36).substr(2, 9),
+            status: 'completed',
+            description: `Charge for reprocessing transaction ${transaction.transactionId} (bulk update)`,
+            relatedTransaction: transaction._id
+          }], { session });
+          
+          results.walletOperations.charged.push({
+            transactionId: transaction.transactionId,
+            userId: user._id,
+            amount: transaction.amount,
+            newBalance: user.wallet.balance
+          });
+        }
+        
+        // Update transaction status
         transaction.status = status;
         transaction.statusUpdatedBy = req.userId;
         transaction.statusUpdatedAt = new Date();
-        if (reason) transaction.statusUpdateReason = reason;
-        if (status === 'successful') transaction.completedAt = new Date();
         
-        await transaction.save();
-        results.updated.push(transactionId);
+        if (reason) {
+          transaction.statusUpdateReason = reason;
+        }
+        
+        if (status === 'successful') {
+          transaction.completedAt = new Date();
+        }
+        
+        // Clear failure info if transitioning from failed to pending/sent
+        if (oldStatus === 'failed' && (status === 'pending' || status === 'sent')) {
+          transaction.failureReason = undefined;
+          transaction.completedAt = undefined;
+        }
+        
+        await transaction.save({ session });
+        results.updated.push(transaction.transactionId);
+        
+        // Create notification
+        let notificationTitle = 'Order Status Updated';
+        let notificationMessage = `Your order ${transaction.transactionId} status has been updated from ${oldStatus} to ${status}.`;
+        
+        if (oldStatus === 'failed' && (status === 'pending' || status === 'sent')) {
+          notificationTitle = 'Order Reprocessing';
+          notificationMessage = `Your previously failed order ${transaction.transactionId} is being reprocessed. GHS ${transaction.amount} has been charged from your wallet.`;
+        } else if (oldStatus === 'successful' && status === 'failed') {
+          notificationTitle = 'Order Failed - Refund Issued';
+          notificationMessage = `Your order ${transaction.transactionId} has failed. GHS ${transaction.amount} has been refunded to your wallet.`;
+        }
+        
+        if (reason) {
+          notificationMessage += ` Reason: ${reason}`;
+        }
+        
+        await Notification.create([{
+          user: transaction.user,
+          title: notificationTitle,
+          message: notificationMessage,
+          type: status === 'successful' ? 'success' : status === 'failed' ? 'error' : 'info',
+          category: 'transaction',
+          relatedTransaction: transaction._id
+        }], { session });
         
       } catch (error) {
         results.failed.push(transactionId);
         results.errors.push({ id: transactionId, error: error.message });
       }
     }
+    
+    // Commit transaction if at least one update was successful
+    if (results.updated.length > 0) {
+      await session.commitTransaction();
+    } else {
+      await session.abortTransaction();
+    }
+    
+    session.endSession();
+    
+    // Calculate financial summary
+    const financialSummary = {
+      totalCharged: results.walletOperations.charged.reduce((sum, op) => sum + op.amount, 0),
+      totalRefunded: results.walletOperations.refunded.reduce((sum, op) => sum + op.amount, 0),
+      usersCharged: results.walletOperations.charged.length,
+      usersRefunded: results.walletOperations.refunded.length,
+      insufficientBalanceCount: results.walletOperations.insufficientBalance.length
+    };
     
     res.json({
       success: true,
@@ -1499,10 +1496,15 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
         totalRequested: transactionIds.length,
         successfullyUpdated: results.updated.length,
         failed: results.failed.length,
-        details: results
+        details: results,
+        financialSummary
       }
     });
+    
   } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
     res.status(500).json({
       success: false,
       message: 'Error in bulk status update',
@@ -1511,6 +1513,172 @@ router.post('/transactions/bulk-status-update', async (req, res) => {
   }
 });
 
+// Alternative: Bulk reprocess failed transactions (specific endpoint)
+router.post('/transactions/bulk-reprocess', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { transactionIds, checkBalance = true } = req.body;
+    
+    if (!transactionIds || !Array.isArray(transactionIds) || transactionIds.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        message: 'Transaction IDs array is required'
+      });
+    }
+    
+    // Fetch all failed transactions
+    const transactions = await Transaction.find({
+      $or: [
+        { _id: { $in: transactionIds } },
+        { transactionId: { $in: transactionIds } }
+      ],
+      status: 'failed' // Only process failed transactions
+    }).session(session);
+    
+    if (transactions.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'No failed transactions found for reprocessing'
+      });
+    }
+    
+    const results = {
+      reprocessed: [],
+      skipped: [],
+      insufficientBalance: []
+    };
+    
+    // Group by user to optimize wallet operations
+    const userTransactions = new Map();
+    for (const transaction of transactions) {
+      const userId = transaction.user.toString();
+      if (!userTransactions.has(userId)) {
+        userTransactions.set(userId, []);
+      }
+      userTransactions.get(userId).push(transaction);
+    }
+    
+    // Process by user
+    for (const [userId, userTxns] of userTransactions) {
+      const user = await User.findById(userId).session(session);
+      
+      if (!user) {
+        userTxns.forEach(t => {
+          results.skipped.push({
+            transactionId: t.transactionId,
+            reason: 'User not found'
+          });
+        });
+        continue;
+      }
+      
+      // Calculate total amount needed
+      const totalRequired = userTxns.reduce((sum, t) => sum + t.amount, 0);
+      
+      // Check balance if required
+      if (checkBalance && user.wallet.balance < totalRequired) {
+        userTxns.forEach(t => {
+          results.insufficientBalance.push({
+            transactionId: t.transactionId,
+            userId: user._id,
+            userName: user.fullName,
+            required: t.amount,
+            totalRequired,
+            available: user.wallet.balance
+          });
+        });
+        continue;
+      }
+      
+      // Process transactions for this user
+      const balanceBefore = user.wallet.balance;
+      let totalCharged = 0;
+      
+      for (const transaction of userTxns) {
+        // Charge user
+        user.wallet.balance -= transaction.amount;
+        totalCharged += transaction.amount;
+        
+        // Update transaction
+        transaction.status = 'pending';
+        transaction.statusUpdatedBy = req.userId;
+        transaction.statusUpdatedAt = new Date();
+        transaction.statusUpdateReason = 'Bulk reprocess of failed transactions';
+        transaction.failureReason = undefined;
+        transaction.completedAt = undefined;
+        
+        await transaction.save({ session });
+        
+        results.reprocessed.push({
+          transactionId: transaction.transactionId,
+          amount: transaction.amount
+        });
+      }
+      
+      // Save user balance
+      await user.save({ session });
+      
+      // Create single wallet transaction for all charges
+      await WalletTransaction.create([{
+        user: userId,
+        type: 'debit',
+        amount: totalCharged,
+        balanceBefore: balanceBefore,
+        balanceAfter: user.wallet.balance,
+        purpose: 'bulk_reprocess',
+        reference: 'BULK_REPROCESS' + Date.now(),
+        status: 'completed',
+        description: `Bulk reprocess charge for ${userTxns.length} failed transactions`,
+        metadata: {
+          transactionIds: userTxns.map(t => t.transactionId),
+          count: userTxns.length
+        }
+      }], { session });
+      
+      // Create notification
+      await Notification.create([{
+        user: userId,
+        title: 'Orders Reprocessing',
+        message: `${userTxns.length} failed order(s) are being reprocessed. Total of GHS ${totalCharged} has been charged from your wallet.`,
+        type: 'info',
+        category: 'transaction'
+      }], { session });
+    }
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    res.json({
+      success: true,
+      message: 'Bulk reprocess completed',
+      results: {
+        totalRequested: transactionIds.length,
+        totalFound: transactions.length,
+        successfullyReprocessed: results.reprocessed.length,
+        skipped: results.skipped.length,
+        insufficientBalance: results.insufficientBalance.length,
+        totalAmountCharged: results.reprocessed.reduce((sum, r) => sum + r.amount, 0),
+        details: results
+      }
+    });
+    
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error in bulk reprocess',
+      error: error.message
+    });
+  }
+});
 // Generate API key for a user
 router.post('/users/:id/generate-api-key', async (req, res) => {
   try {
