@@ -353,7 +353,7 @@ const exportHistorySchema = new mongoose.Schema({
   status: {
     current: {
       type: String,
-      enum: ['pending', 'exporting', 'exported', 'processing', 'completed', 'failed', 'partial'],
+      enum: ['pending', 'exporting', 'exported', 'processing', 'completed', 'failed', 'partial','re-export'],
       default: 'pending'
     },
     

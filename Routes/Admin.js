@@ -1908,6 +1908,7 @@ router.get('/export-history', async (req, res) => {
 });
 
 // Re-export orders from a previous batch/export
+// Re-export orders from a previous batch/export
 router.post('/batches/:batchId/re-export', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -1934,11 +1935,6 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
         message: 'Batch not found'
       });
     }
-    
-    // Get the original export details from ExportHistory
-    const originalExport = await ExportHistory.findOne({ 
-      exportId: batch.batchId.replace('BATCH-', '') 
-    });
     
     // Fetch the transactions from the batch
     const orderIds = batch.orders.map(o => o.transactionId);
@@ -1972,26 +1968,25 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
     const processingMinutes = exportSettings?.autoComplete?.fixedTimeMinutes || 30;
     const estimatedCompletionTime = new Date(Date.now() + processingMinutes * 60000);
     
-    // Create re-export history
+    // Create re-export history with CORRECT enum values from your schema
     const exportHistory = new ExportHistory({
       exportId: reExportId,
-      parentExportId: originalExport?.exportId || batch.batchId.replace('BATCH-', ''),
       batchNumber: exportCount + 1,
       exportDetails: {
         totalOrders: orders.length,
         totalAmount: orders.reduce((sum, o) => sum + o.amount, 0),
         orderIds: orders.map(o => o._id),
-        exportMethod: 're-export',
-        triggerSource: 'admin_batches'
+        exportMethod: 'manual',  // FIXED: Use valid enum value from schema
+        triggerSource: 'admin_dashboard'  // FIXED: Use valid enum value from schema
       },
       timestamps: {
         exportedAt: new Date(),
         estimatedCompletionTime: markAsSuccessful ? estimatedCompletionTime : null
       },
       status: {
-        current: markAsSuccessful ? 'processing' : 're-exported',
+        current: markAsSuccessful ? 'processing' : 're-export',  // FIXED: Use 're-export' not 're-exported'
         history: [{
-          status: markAsSuccessful ? 'processing' : 're-exported',
+          status: markAsSuccessful ? 'processing' : 're-export',
           timestamp: new Date(),
           message: markAsSuccessful ? 'Re-exported and sent to MTN' : 'Orders re-exported',
           updatedBy: req.userId
@@ -2017,9 +2012,10 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
             $set: {
               status: 'sent',
               exportedAt: new Date(),
-              'metadata.reExportId': reExportId,
-              'metadata.originalExportId': batch.batchId.replace('BATCH-', ''),
-              'metadata.estimatedCompletion': estimatedCompletionTime
+              'metadata.exportId': reExportId,
+              'metadata.batchId': reBatchId,
+              'metadata.estimatedCompletion': estimatedCompletionTime,
+              'metadata.processingMinutes': processingMinutes
             }
           }
         }
@@ -2028,14 +2024,42 @@ router.post('/batches/:batchId/re-export', async (req, res) => {
       await Transaction.bulkWrite(bulkOps, { session });
     }
     
+    // Update system status
+    await SystemStatus.findOneAndUpdate(
+      { _id: 'current_status' },
+      {
+        $set: {
+          lastExport: {
+            exportId: reExportId,
+            exportedAt: new Date(),
+            totalOrders: orders.length,
+            status: markAsSuccessful ? 'processing' : 're-export',  // Use 're-export' here too
+            exportedBy: req.userId,
+            processingMinutes: markAsSuccessful ? processingMinutes : 0,
+            completedAt: null
+          },
+          'currentProcessing.isProcessing': markAsSuccessful,
+          'currentProcessing.activeExports': markAsSuccessful ? [{
+            exportId: reExportId,
+            startedAt: new Date(),
+            estimatedCompletion: estimatedCompletionTime,
+            processingMinutes,
+            progress: 0,
+            orderCount: orders.length
+          }] : []
+        }
+      },
+      { session }
+    );
+    
     // Create new batch record for re-export
     await Batch.create([{
       batchId: reBatchId,
-      parentBatchId: batch.batchId,
       batchNumber: exportCount + 1,
       exportedBy: req.userId,
       exportDate: new Date(),
       processingStatus: markAsSuccessful ? 'sent_to_third_party' : 're-exported',
+      status: markAsSuccessful ? 'processing' : 'exported',  // Add proper status
       orders: orders.map(o => ({
         transactionId: o.transactionId,
         beneficiaryNumber: o.dataDetails?.beneficiaryNumber,
