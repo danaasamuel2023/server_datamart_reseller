@@ -1,6 +1,7 @@
 // =============================================
 // GHANA MTN DATA RESELLING PLATFORM - MIDDLEWARE
 // Node.js with Express
+// UPDATED: Removed recent order blocking
 // =============================================
 
 const jwt = require('jsonwebtoken');
@@ -367,7 +368,7 @@ const validators = {
 };
 
 // =============================================
-// 5. WALLET MIDDLEWARE - UPDATED FOR MANUAL PROCESSING
+// 5. WALLET MIDDLEWARE - UPDATED (NO RATE LIMITING)
 // =============================================
 
 const walletMiddleware = {
@@ -404,16 +405,12 @@ const walletMiddleware = {
     }
   },
 
-  // UPDATED: Allow orders even with pending transactions (manual processing)
+  // UPDATED: Simplified wallet lock - no recent order checks
   lockWallet: async (req, res, next) => {
     try {
       const userId = req.userId;
       
-      // NO LONGER CHECK FOR PENDING TRANSACTIONS
-      // Since orders are processed manually and money is deducted immediately,
-      // users can place multiple orders as long as they have balance
-      
-      // Optional: Check if wallet is locked for security reasons
+      // Only check if wallet is locked by admin for security reasons
       const user = await User.findById(userId);
       if (user?.wallet?.isLocked) {
         return res.status(403).json({
@@ -422,33 +419,9 @@ const walletMiddleware = {
         });
       }
       
-      // Optional: Rate limit to prevent rapid order spamming
-      const recentOrderCount = await Transaction.countDocuments({
-        user: userId,
-        type: 'data_purchase',
-        createdAt: { $gte: new Date(Date.now() - 60000) } // Last minute
-      });
-      
-      if (recentOrderCount >= 10) {
-        return res.status(429).json({
-          success: false,
-          message: 'Too many orders placed recently. Please wait a moment before placing another order.'
-        });
-      }
-
-      // Optional: Check for processing status (if you use this status when actively fulfilling)
-      const processingTx = await Transaction.findOne({
-        user: userId,
-        status: 'processing', // Only if you mark orders as 'processing' when actively fulfilling
-        createdAt: { $gte: new Date(Date.now() - 300000) } // Within last 5 minutes
-      });
-
-      if (processingTx) {
-        return res.status(409).json({
-          success: false,
-          message: 'We are currently processing your order. Please wait a moment.'
-        });
-      }
+      // *** REMOVED: Recent order count check ***
+      // *** REMOVED: Processing transaction check ***
+      // Users can now place orders freely as long as they have balance
 
       next();
     } catch (error) {
@@ -518,7 +491,7 @@ const systemMiddleware = {
 };
 
 // =============================================
-// 7. RATE LIMITING MIDDLEWARE (FIXED FOR IPv6)
+// 7. RATE LIMITING MIDDLEWARE
 // =============================================
 
 const rateLimiters = {
@@ -529,7 +502,6 @@ const rateLimiters = {
     message: 'Too many requests, please try again later',
     standardHeaders: true,
     legacyHeaders: false,
-    // Use default key generator (handles IPv6 properly)
     keyGenerator: (req) => req.ip
   }),
 
@@ -539,7 +511,6 @@ const rateLimiters = {
     max: 5, // 5 requests per 15 minutes
     message: 'Too many attempts, please try again later',
     skipSuccessfulRequests: true,
-    // Use default key generator
     keyGenerator: (req) => req.ip
   }),
 
@@ -550,20 +521,18 @@ const rateLimiters = {
     message: 'Too many login attempts, please try again later',
     skipSuccessfulRequests: true,
     keyGenerator: (req) => {
-      // Combine email/phone with IP
       const identifier = req.body?.emailOrPhone || '';
       return `${identifier}_${req.ip}`;
     },
     skip: (req) => !req.body?.emailOrPhone && !req.ip
   }),
 
-  // Transaction rate limit
+  // Transaction rate limit - INCREASED FOR FLEXIBILITY
   transaction: rateLimit({
     windowMs: 1 * 60 * 1000, // 1 minute
-    max: 10, // 10 transactions per minute
+    max: 50, // Increased from 10 to 50 transactions per minute
     message: 'Transaction rate limit exceeded, please wait',
     keyGenerator: (req) => {
-      // Use userId if available, otherwise use IP
       return req.userId ? `user_${req.userId}` : `ip_${req.ip}`;
     }
   }),
@@ -574,7 +543,6 @@ const rateLimiters = {
     max: 60, // 60 requests per minute for API users
     message: 'API rate limit exceeded',
     keyGenerator: (req) => {
-      // Use API key if available, otherwise use IP
       const apiKey = req.header('X-API-Key');
       return apiKey ? `api_${apiKey}` : `ip_${req.ip}`;
     }

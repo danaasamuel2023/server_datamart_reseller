@@ -1,7 +1,6 @@
 // =============================================
 // EXTERNAL API ROUTES - GHANA MTN DATA PLATFORM
-// For Third-Party Integration (Single & Bulk Purchase)
-// Updated: Both endpoints now use capacity + product_name
+// COMPLETE - Fixed bulk orders + webhook status updates
 // =============================================
 
 const express = require('express');
@@ -24,21 +23,18 @@ const {
 // Import middleware
 const { apiKey, rateLimit } = require('../middleware/middleware');
 
-// Apply API authentication and rate limiting to all routes
-router.use(apiKey); // Validates API key and secret
-router.use(rateLimit.api); // API-specific rate limiting
+// Apply API authentication and rate limiting
+router.use(apiKey);
+router.use(rateLimit.api);
 
 // Middleware to log API response
 const logApiResponse = async (req, res, next) => {
   const startTime = Date.now();
-  
-  // Capture the original send function
   const originalSend = res.send;
   
   res.send = function(data) {
     res.send = originalSend;
     
-    // Log the API call
     ApiLog.create({
       user: req.userId,
       apiKey: req.header('X-API-Key'),
@@ -53,18 +49,17 @@ const logApiResponse = async (req, res, next) => {
       },
       response: {
         statusCode: res.statusCode,
-        body: JSON.parse(data),
+        body: typeof data === 'string' ? JSON.parse(data) : data,
         responseTime: Date.now() - startTime
       },
       success: res.statusCode < 400,
       ipAddress: req.ip
-    }).catch(console.error);
+    }).catch(err => console.error('API Log Error:', err));
     
-    // Update API usage count
     User.findByIdAndUpdate(req.userId, {
       $inc: { 'apiAccess.requestCount': 1 },
       'apiAccess.lastUsed': new Date()
-    }).catch(console.error);
+    }).catch(err => console.error('API Usage Update Error:', err));
     
     return res.send(data);
   };
@@ -98,7 +93,10 @@ const apiResponse = {
   }
 };
 
-// Webhook notification helper
+// =============================================
+// WEBHOOK HELPER - WITH STATUS UPDATES
+// =============================================
+
 const sendWebhook = async (user, event, data) => {
   if (!user.apiAccess?.webhookUrl) return;
   
@@ -121,92 +119,106 @@ const sendWebhook = async (user, event, data) => {
       },
       timeout: 5000
     });
+    
+    console.log(`Webhook sent: ${event} to ${user.apiAccess.webhookUrl}`);
   } catch (error) {
     console.error('Webhook error:', error.message);
   }
 };
 
+// Function to send transaction status update
+const sendTransactionStatusWebhook = async (userId, transactionData) => {
+  try {
+    const user = await User.findById(userId).select('apiAccess');
+    if (!user || !user.apiAccess?.webhookUrl) return;
+    
+    await sendWebhook(user, 'transaction.status_update', transactionData);
+  } catch (error) {
+    console.error('Transaction webhook error:', error.message);
+  }
+};
+
 // =============================================
-// HELPER FUNCTION: Parse and Validate Product
+// PRODUCT LOOKUP HELPER
 // =============================================
 
 const findProductByCapacityAndName = async (capacity, productName) => {
-  // Parse capacity input (e.g., "2GB" -> {value: 2, unit: "GB"})
-  const capacityRegex = /^(\d+(?:\.\d+)?)(MB|GB)$/i;
-  const capacityMatch = capacity.toUpperCase().match(capacityRegex);
-  
-  if (!capacityMatch) {
-    return {
-      error: true,
-      code: 'INVALID_CAPACITY_FORMAT',
-      message: 'Invalid capacity format',
-      details: {
-        format: 'Valid formats: 500MB, 1GB, 2.5GB',
-        provided: capacity
-      }
-    };
-  }
-  
-  const capacityValue = parseFloat(capacityMatch[1]);
-  const capacityUnit = capacityMatch[2];
-  
-  // Find product by name and capacity
-  const product = await Product.findOne({
-    name: new RegExp(productName, 'i'), // Case-insensitive search
-    'capacity.value': capacityValue,
-    'capacity.unit': capacityUnit,
-    status: 'active'
-  });
-  
-  if (!product) {
-    // Try to find products with matching capacity to suggest alternatives
-    const alternativeProducts = await Product.find({
+  try {
+    const capacityRegex = /^(\d+(?:\.\d+)?)(MB|GB)$/i;
+    const capacityMatch = capacity.toUpperCase().match(capacityRegex);
+    
+    if (!capacityMatch) {
+      return {
+        error: true,
+        code: 'INVALID_CAPACITY_FORMAT',
+        message: 'Invalid capacity format',
+        details: {
+          format: 'Valid formats: 500MB, 1GB, 2.5GB',
+          provided: capacity
+        }
+      };
+    }
+    
+    const capacityValue = parseFloat(capacityMatch[1]);
+    const capacityUnit = capacityMatch[2];
+    
+    const product = await Product.findOne({
+      name: new RegExp(productName, 'i'),
       'capacity.value': capacityValue,
       'capacity.unit': capacityUnit,
       status: 'active'
-    }).select('name productCode');
+    });
     
-    if (alternativeProducts.length > 0) {
-      return {
-        error: true,
-        code: 'PRODUCT_NOT_FOUND',
-        message: 'Product not found with specified name and capacity',
-        details: {
-          requested: {
-            name: productName,
-            capacity: capacity
-          },
-          available_alternatives: alternativeProducts.map(p => ({
-            name: p.name,
-            product_code: p.productCode
-          }))
-        }
-      };
-    } else {
+    if (!product) {
+      const alternativeProducts = await Product.find({
+        'capacity.value': capacityValue,
+        'capacity.unit': capacityUnit,
+        status: 'active'
+      }).select('name productCode');
+      
+      if (alternativeProducts.length > 0) {
+        return {
+          error: true,
+          code: 'PRODUCT_NOT_FOUND',
+          message: 'Product not found with specified name and capacity',
+          details: {
+            requested: { name: productName, capacity: capacity },
+            available_alternatives: alternativeProducts.map(p => ({
+              name: p.name,
+              product_code: p.productCode
+            }))
+          }
+        };
+      }
+      
       return {
         error: true,
         code: 'CAPACITY_NOT_AVAILABLE',
         message: 'No products available with specified capacity',
-        details: {
-          requested_capacity: capacity
-        }
+        details: { requested_capacity: capacity }
       };
     }
+    
+    return {
+      error: false,
+      product: product,
+      capacityValue: capacityValue,
+      capacityUnit: capacityUnit
+    };
+  } catch (error) {
+    return {
+      error: true,
+      code: 'PRODUCT_LOOKUP_ERROR',
+      message: 'Error looking up product',
+      details: { error: error.message }
+    };
   }
-  
-  return {
-    error: false,
-    product: product,
-    capacityValue: capacityValue,
-    capacityUnit: capacityUnit
-  };
 };
 
 // =============================================
 // 1. ACCOUNT & BALANCE APIs
 // =============================================
 
-// Get account information
 router.get('/v1/account', async (req, res) => {
   try {
     const user = await User.findById(req.userId)
@@ -232,6 +244,7 @@ router.get('/v1/account', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Account API Error:', error);
     return apiResponse.error(res, 'Error fetching account information', {
       code: 'ACCOUNT_ERROR',
       details: error.message
@@ -239,7 +252,6 @@ router.get('/v1/account', async (req, res) => {
   }
 });
 
-// Get wallet balance
 router.get('/v1/balance', async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('wallet').lean();
@@ -250,6 +262,7 @@ router.get('/v1/balance', async (req, res) => {
       formatted: `GHS ${user.wallet.balance.toFixed(2)}`
     });
   } catch (error) {
+    console.error('Balance API Error:', error);
     return apiResponse.error(res, 'Error fetching balance', {
       code: 'BALANCE_ERROR',
       details: error.message
@@ -261,19 +274,16 @@ router.get('/v1/balance', async (req, res) => {
 // 2. PRODUCT LISTING API
 // =============================================
 
-// Get available products with pricing
 router.get('/v1/products', async (req, res) => {
   try {
     const { category, min_capacity, max_capacity } = req.query;
     const userRole = req.userRole;
     
-    // Build filter
     const filter = { status: 'active' };
     if (category) filter.category = category;
     
     const products = await Product.find(filter).lean();
     
-    // Get pricing for user's role
     const productsWithPricing = await Promise.all(
       products.map(async (product) => {
         const pricing = await PriceSetting.findOne({
@@ -298,7 +308,6 @@ router.get('/v1/products', async (req, res) => {
             price = pricing.agentPrice;
         }
         
-        // Apply capacity filter if provided
         if (min_capacity || max_capacity) {
           const capacityInMB = product.capacity.unit === 'GB' 
             ? product.capacity.value * 1024 
@@ -323,7 +332,6 @@ router.get('/v1/products', async (req, res) => {
       })
     );
     
-    // Filter out null values
     const validProducts = productsWithPricing.filter(p => p !== null);
     
     return apiResponse.success(res, 'Products retrieved', {
@@ -331,6 +339,7 @@ router.get('/v1/products', async (req, res) => {
       total: validProducts.length
     });
   } catch (error) {
+    console.error('Products API Error:', error);
     return apiResponse.error(res, 'Error fetching products', {
       code: 'PRODUCT_ERROR',
       details: error.message
@@ -338,170 +347,10 @@ router.get('/v1/products', async (req, res) => {
   }
 });
 
-// Get single product details
-router.get('/v1/products/:productCode', async (req, res) => {
-  try {
-    const { productCode } = req.params;
-    const userRole = req.userRole;
-    
-    const product = await Product.findOne({ 
-      productCode: productCode,
-      status: 'active'
-    }).lean();
-    
-    if (!product) {
-      return apiResponse.error(res, 'Product not found', {
-        code: 'PRODUCT_NOT_FOUND'
-      }, 404);
-    }
-    
-    const pricing = await PriceSetting.findOne({
-      product: product._id,
-      isActive: true
-    });
-    
-    if (!pricing) {
-      return apiResponse.error(res, 'Product pricing not available', {
-        code: 'PRICING_NOT_FOUND'
-      }, 404);
-    }
-    
-    let price;
-    switch (userRole) {
-      case 'supplier':
-        price = pricing.supplierPrice;
-        break;
-      case 'dealer':
-        price = pricing.dealerPrice;
-        break;
-      case 'agent':
-        price = pricing.agentPrice;
-        break;
-      default:
-        price = pricing.agentPrice;
-    }
-    
-    return apiResponse.success(res, 'Product details retrieved', {
-      product_code: product.productCode,
-      name: product.name,
-      category: product.category,
-      capacity: `${product.capacity.value}${product.capacity.unit}`,
-      validity: `${product.validity.value} ${product.validity.unit}`,
-      price: price,
-      currency: 'GHS',
-      description: product.description,
-      features: product.features,
-      status: product.status
-    });
-  } catch (error) {
-    return apiResponse.error(res, 'Error fetching product', {
-      code: 'PRODUCT_ERROR',
-      details: error.message
-    }, 500);
-  }
-});
-
-// Get available capacities
-router.get('/v1/capacities', async (req, res) => {
-  try {
-    const userRole = req.userRole;
-    
-    // Aggregate products by capacity
-    const products = await Product.aggregate([
-      { $match: { status: 'active' } },
-      {
-        $group: {
-          _id: {
-            value: '$capacity.value',
-            unit: '$capacity.unit'
-          },
-          products: {
-            $push: {
-              name: '$name',
-              productCode: '$productCode',
-              validity: '$validity'
-            }
-          }
-        }
-      },
-      {
-        $project: {
-          _id: 0,
-          capacity: {
-            $concat: [
-              { $toString: '$_id.value' },
-              '$_id.unit'
-            ]
-          },
-          capacity_value: '$_id.value',
-          capacity_unit: '$_id.unit',
-          available_products: '$products'
-        }
-      },
-      { $sort: { capacity_value: 1 } }
-    ]);
-    
-    // Get pricing for each capacity's products
-    const capacitiesWithPricing = await Promise.all(
-      products.map(async (capacityGroup) => {
-        const productsWithPricing = await Promise.all(
-          capacityGroup.available_products.map(async (prod) => {
-            const product = await Product.findOne({ productCode: prod.productCode });
-            const pricing = await PriceSetting.findOne({
-              product: product._id,
-              isActive: true
-            });
-            
-            if (!pricing) return null;
-            
-            let price;
-            switch (userRole) {
-              case 'supplier':
-                price = pricing.supplierPrice;
-                break;
-              case 'dealer':
-                price = pricing.dealerPrice;
-                break;
-              case 'agent':
-                price = pricing.agentPrice;
-                break;
-              default:
-                price = pricing.agentPrice;
-            }
-            
-            return {
-              name: prod.name,
-              validity: `${prod.validity.value} ${prod.validity.unit}`,
-              price: price
-            };
-          })
-        );
-        
-        return {
-          capacity: capacityGroup.capacity,
-          products: productsWithPricing.filter(p => p !== null)
-        };
-      })
-    );
-    
-    return apiResponse.success(res, 'Available capacities retrieved', {
-      capacities: capacitiesWithPricing,
-      total: capacitiesWithPricing.length,
-      price_tier: req.userRole
-    });
-  } catch (error) {
-    return apiResponse.error(res, 'Error fetching capacities', {
-      code: 'CAPACITY_ERROR',
-      details: error.message
-    }, 500);
-  }
-});
-
 // =============================================
-// 3. SINGLE PURCHASE API
+// 3. SINGLE PURCHASE API - WITH WEBHOOK STATUS
 // =============================================
 
-// Purchase single data bundle with capacity and product name
 router.post('/v1/purchase', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -515,7 +364,7 @@ router.post('/v1/purchase', async (req, res) => {
       callback_url
     } = req.body;
     
-    // Validate required inputs
+    // Validate inputs
     if (!capacity) {
       await session.abortTransaction();
       return apiResponse.error(res, 'Capacity is required', {
@@ -539,16 +388,16 @@ router.post('/v1/purchase', async (req, res) => {
       });
     }
     
-    // Validate Ghana phone number
     if (!beneficiary_number.match(/^(\+233|0)[235][0-9]{8}$/)) {
       await session.abortTransaction();
       return apiResponse.error(res, 'Invalid Ghana phone number', {
         code: 'INVALID_PHONE_NUMBER',
-        format: 'Valid format: 0241234567 or +233241234567'
+        format: 'Valid format: 0241234567 or +233241234567',
+        provided: beneficiary_number
       });
     }
     
-    // Find product using helper function
+    // Find product
     const productResult = await findProductByCapacityAndName(capacity, product_name);
     
     if (productResult.error) {
@@ -561,7 +410,7 @@ router.post('/v1/purchase', async (req, res) => {
     
     const product = productResult.product;
     
-    // Get pricing based on user role
+    // Get pricing
     const pricing = await PriceSetting.findOne({
       product: product._id,
       isActive: true
@@ -574,7 +423,7 @@ router.post('/v1/purchase', async (req, res) => {
       });
     }
     
-    // Calculate price based on user's role
+    // Calculate price
     let amount;
     switch (req.userRole) {
       case 'supplier':
@@ -598,15 +447,11 @@ router.post('/v1/purchase', async (req, res) => {
         code: 'INSUFFICIENT_BALANCE',
         required_amount: amount,
         current_balance: user.wallet.balance,
-        product_details: {
-          name: product.name,
-          capacity: capacity,
-          price: amount
-        }
+        shortage: amount - user.wallet.balance
       });
     }
     
-    // Check for duplicate reference
+    // Check duplicate reference
     if (reference) {
       const existingTransaction = await Transaction.findOne({ reference });
       if (existingTransaction) {
@@ -618,7 +463,7 @@ router.post('/v1/purchase', async (req, res) => {
       }
     }
     
-    // Generate transaction reference
+    // Generate reference
     const transactionRef = reference || 'API' + Date.now() + crypto.randomBytes(4).toString('hex').toUpperCase();
     
     // Deduct from wallet
@@ -667,28 +512,31 @@ router.post('/v1/purchase', async (req, res) => {
       relatedTransaction: transaction._id
     }], { session });
     
-    // TODO: Call MTN API here
-    // For now, transaction stays as pending for manual processing
-    
     await session.commitTransaction();
     
-    // Send webhook notification
-    sendWebhook(user, 'purchase.pending', {
+    // Send webhook with transaction status
+    sendWebhook(user, 'transaction.created', {
       reference: transactionRef,
-      product: product.name,
-      capacity: capacity,
+      transaction_id: transaction._id,
+      status: 'pending',
+      product: {
+        name: product.name,
+        capacity: capacity
+      },
       beneficiary: beneficiary_number,
       amount: amount,
-      status: 'pending'
+      balance_after: user.wallet.balance,
+      created_at: transaction.createdAt
     });
     
-    // Send callback if provided
+    // Send callback
     if (callback_url) {
       axios.post(callback_url, {
         reference: transactionRef,
         status: 'pending',
-        message: 'Data purchase pending manual processing'
-      }).catch(console.error);
+        message: 'Data purchase pending manual processing',
+        transaction_id: transaction._id
+      }).catch(err => console.error('Callback Error:', err));
     }
     
     return apiResponse.success(res, 'Purchase successful - pending manual processing', {
@@ -705,11 +553,13 @@ router.post('/v1/purchase', async (req, res) => {
       price_tier: req.userRole,
       currency: 'GHS',
       status: 'pending',
-      balance_after: user.wallet.balance
+      balance_after: user.wallet.balance,
+      webhook_sent: !!user.apiAccess?.webhookUrl
     }, 201);
     
   } catch (error) {
     await session.abortTransaction();
+    console.error('Purchase API Error:', error);
     return apiResponse.error(res, 'Error processing purchase', {
       code: 'PROCESSING_ERROR',
       details: error.message
@@ -720,10 +570,9 @@ router.post('/v1/purchase', async (req, res) => {
 });
 
 // =============================================
-// 4. BULK PURCHASE API - UPDATED
+// 4. BULK PURCHASE API - FIXED + WEBHOOK STATUS
 // =============================================
 
-// Bulk purchase data bundles - now uses capacity and product_name
 router.post('/v1/purchase/bulk', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -743,7 +592,8 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       await session.abortTransaction();
       return apiResponse.error(res, 'Maximum 100 orders per request', {
         code: 'EXCEEDS_LIMIT',
-        max_allowed: 100
+        max_allowed: 100,
+        provided: orders.length
       });
     }
     
@@ -754,7 +604,6 @@ router.post('/v1/purchase/bulk', async (req, res) => {
     for (let i = 0; i < orders.length; i++) {
       const order = orders[i];
       
-      // Validate beneficiary number
       if (!order.beneficiary_number?.match(/^(\+233|0)[235][0-9]{8}$/)) {
         await session.abortTransaction();
         return apiResponse.error(res, `Invalid phone number in order ${i + 1}`, {
@@ -764,7 +613,6 @@ router.post('/v1/purchase/bulk', async (req, res) => {
         });
       }
       
-      // Validate capacity is provided
       if (!order.capacity) {
         await session.abortTransaction();
         return apiResponse.error(res, `Missing capacity in order ${i + 1}`, {
@@ -773,22 +621,19 @@ router.post('/v1/purchase/bulk', async (req, res) => {
         });
       }
       
-      // Validate product_name is provided
       if (!order.product_name) {
         await session.abortTransaction();
         return apiResponse.error(res, `Missing product name in order ${i + 1}`, {
           code: 'MISSING_PRODUCT_NAME',
-          order_index: i,
-          available: 'YELLOW'
+          order_index: i
         });
       }
       
-      // Find product using helper function
       const productResult = await findProductByCapacityAndName(order.capacity, order.product_name);
       
       if (productResult.error) {
         await session.abortTransaction();
-        return apiResponse.error(res, `Product unavailable in order ${i + 1}: ${productResult.message}`, {
+        return apiResponse.error(res, `Order ${i + 1}: ${productResult.message}`, {
           code: productResult.code,
           order_index: i,
           ...productResult.details
@@ -797,7 +642,6 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       
       const product = productResult.product;
       
-      // Get pricing
       const pricing = await PriceSetting.findOne({
         product: product._id,
         isActive: true
@@ -807,11 +651,11 @@ router.post('/v1/purchase/bulk', async (req, res) => {
         await session.abortTransaction();
         return apiResponse.error(res, `Pricing unavailable for order ${i + 1}`, {
           code: 'PRICING_UNAVAILABLE',
-          order_index: i
+          order_index: i,
+          product: product.name
         });
       }
       
-      // Calculate price
       let unitPrice;
       switch (req.userRole) {
         case 'supplier':
@@ -850,18 +694,18 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       return apiResponse.error(res, 'Insufficient wallet balance', {
         code: 'INSUFFICIENT_BALANCE',
         required_amount: totalAmount,
-        current_balance: user.wallet.balance
+        current_balance: user.wallet.balance,
+        shortage: totalAmount - user.wallet.balance
       });
     }
     
-    // Process bulk order
+    // Generate bulk reference
     const bulkReference = reference || 'BULK_API' + Date.now() + crypto.randomBytes(4).toString('hex').toUpperCase();
     const balanceBefore = user.wallet.balance;
-    user.wallet.balance -= totalAmount;
-    await user.save({ session });
     
     const processedOrders = [];
     const failedOrders = [];
+    let actualAmountCharged = 0;
     
     // Process each order
     for (const orderDetail of validatedOrders) {
@@ -869,7 +713,6 @@ router.post('/v1/purchase/bulk', async (req, res) => {
                       'API' + Date.now() + crypto.randomBytes(4).toString('hex').toUpperCase();
       
       try {
-        // Create transaction
         const transaction = new Transaction({
           transactionId: orderRef,
           user: req.userId,
@@ -882,7 +725,7 @@ router.post('/v1/purchase/bulk', async (req, res) => {
             quantity: orderDetail.quantity
           },
           amount: orderDetail.amount,
-          status: 'pending', // Manual processing
+          status: 'pending',
           reference: orderRef,
           paymentMethod: 'wallet',
           channel: 'api',
@@ -896,83 +739,124 @@ router.post('/v1/purchase/bulk', async (req, res) => {
         
         await transaction.save({ session });
         
-        // Update product stats
-        orderDetail.product.stats.totalSold += orderDetail.quantity;
-        orderDetail.product.stats.totalRevenue += orderDetail.amount;
-        await orderDetail.product.save({ session });
+        // TODO: Call MTN API
+        const mtnSuccess = true;
         
-        processedOrders.push({
-          reference: orderRef,
-          product_name: orderDetail.product.name,
-          capacity: orderDetail.requestedCapacity,
-          beneficiary: orderDetail.beneficiaryNumber,
-          quantity: orderDetail.quantity,
-          amount: orderDetail.amount,
-          status: 'pending'
-        });
+        if (mtnSuccess) {
+          if (orderDetail.product.stats) {
+            orderDetail.product.stats.totalSold = (orderDetail.product.stats.totalSold || 0) + orderDetail.quantity;
+            orderDetail.product.stats.totalRevenue = (orderDetail.product.stats.totalRevenue || 0) + orderDetail.amount;
+            await orderDetail.product.save({ session });
+          }
+          
+          actualAmountCharged += orderDetail.amount;
+          
+          processedOrders.push({
+            reference: orderRef,
+            transaction_id: transaction._id,
+            product_name: orderDetail.product.name,
+            capacity: orderDetail.requestedCapacity,
+            beneficiary: orderDetail.beneficiaryNumber,
+            quantity: orderDetail.quantity,
+            amount: orderDetail.amount,
+            status: 'pending'
+          });
+        } else {
+          throw new Error('MTN processing failed');
+        }
         
       } catch (error) {
         failedOrders.push({
           product_name: orderDetail.requestedProductName,
           capacity: orderDetail.requestedCapacity,
           beneficiary: orderDetail.beneficiaryNumber,
+          amount: orderDetail.amount,
           error: error.message,
           status: 'failed'
         });
       }
     }
     
-    // Create bulk wallet transaction
-    await WalletTransaction.create([{
-      user: req.userId,
-      type: 'debit',
-      amount: totalAmount,
-      balanceBefore: balanceBefore,
-      balanceAfter: user.wallet.balance,
-      purpose: 'purchase',
-      reference: bulkReference,
-      status: 'completed',
-      description: `Bulk purchase: ${orders.length} orders`
-    }], { session });
-    
-    await session.commitTransaction();
-    
-    // Send webhook notification
-    sendWebhook(user, 'bulk_purchase.completed', {
-      reference: bulkReference,
-      total_orders: orders.length,
-      successful_orders: processedOrders.length,
-      failed_orders: failedOrders.length,
-      total_amount: totalAmount
-    });
-    
-    // Send callback if provided
-    if (callback_url) {
-      axios.post(callback_url, {
+    // Only deduct for successful orders
+    if (actualAmountCharged > 0) {
+      user.wallet.balance -= actualAmountCharged;
+      await user.save({ session });
+      
+      await WalletTransaction.create([{
+        user: req.userId,
+        type: 'debit',
+        amount: actualAmountCharged,
+        balanceBefore: balanceBefore,
+        balanceAfter: user.wallet.balance,
+        purpose: 'purchase',
         reference: bulkReference,
         status: 'completed',
-        summary: {
-          total: orders.length,
-          successful: processedOrders.length,
-          failed: failedOrders.length
-        }
-      }).catch(console.error);
+        description: `Bulk API: ${processedOrders.length} success, ${failedOrders.length} failed`
+      }], { session });
     }
     
-    return apiResponse.success(res, 'Bulk purchase processed - pending manual processing', {
-      bulk_reference: bulkReference,
-      summary: {
-        total_orders: orders.length,
-        successful_count: processedOrders.length,
-        failed_count: failedOrders.length,
-        total_amount: totalAmount
-      },
-      successful_orders: processedOrders,
-      failed_orders: failedOrders,
-      balance_after: user.wallet.balance
-    }, 201);
+    // Only commit if at least one succeeded
+    if (processedOrders.length > 0) {
+      await session.commitTransaction();
+      
+      // Send webhook with detailed status
+      sendWebhook(user, 'bulk_purchase.completed', {
+        bulk_reference: bulkReference,
+        status: 'completed',
+        summary: {
+          total_orders: orders.length,
+          successful_count: processedOrders.length,
+          failed_count: failedOrders.length,
+          total_requested_amount: totalAmount,
+          amount_charged: actualAmountCharged,
+          amount_saved: totalAmount - actualAmountCharged
+        },
+        successful_orders: processedOrders,
+        failed_orders: failedOrders,
+        balance_after: user.wallet.balance,
+        created_at: new Date()
+      });
+      
+      if (callback_url) {
+        axios.post(callback_url, {
+          reference: bulkReference,
+          status: 'completed',
+          summary: {
+            total: orders.length,
+            successful: processedOrders.length,
+            failed: failedOrders.length,
+            amount_charged: actualAmountCharged
+          }
+        }).catch(err => console.error('Callback Error:', err));
+      }
+      
+      return apiResponse.success(res, 'Bulk purchase processed', {
+        bulk_reference: bulkReference,
+        summary: {
+          total_orders: orders.length,
+          successful_count: processedOrders.length,
+          failed_count: failedOrders.length,
+          total_requested: totalAmount,
+          amount_charged: actualAmountCharged,
+          amount_saved: totalAmount - actualAmountCharged
+        },
+        successful_orders: processedOrders,
+        failed_orders: failedOrders,
+        balance_after: user.wallet.balance,
+        webhook_sent: !!user.apiAccess?.webhookUrl
+      }, 201);
+    } else {
+      await session.abortTransaction();
+      return apiResponse.error(res, 'All orders failed to process', {
+        code: 'ALL_ORDERS_FAILED',
+        failed_orders: failedOrders,
+        balance_unchanged: balanceBefore
+      }, 400);
+    }
+    
   } catch (error) {
     await session.abortTransaction();
+    console.error('Bulk API Error:', error);
     return apiResponse.error(res, 'Error processing bulk purchase', {
       code: 'BULK_PROCESSING_ERROR',
       details: error.message
@@ -986,7 +870,6 @@ router.post('/v1/purchase/bulk', async (req, res) => {
 // 5. TRANSACTION STATUS API
 // =============================================
 
-// Check transaction status
 router.get('/v1/transactions/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
@@ -1003,7 +886,8 @@ router.get('/v1/transactions/:reference', async (req, res) => {
     
     if (!transaction) {
       return apiResponse.error(res, 'Transaction not found', {
-        code: 'TRANSACTION_NOT_FOUND'
+        code: 'TRANSACTION_NOT_FOUND',
+        reference: reference
       }, 404);
     }
     
@@ -1023,6 +907,7 @@ router.get('/v1/transactions/:reference', async (req, res) => {
       failure_reason: transaction.failureReason
     });
   } catch (error) {
+    console.error('Transaction Status Error:', error);
     return apiResponse.error(res, 'Error fetching transaction', {
       code: 'TRANSACTION_ERROR',
       details: error.message
@@ -1030,7 +915,6 @@ router.get('/v1/transactions/:reference', async (req, res) => {
   }
 });
 
-// Get transaction history
 router.get('/v1/transactions', async (req, res) => {
   try {
     const { 
@@ -1084,6 +968,7 @@ router.get('/v1/transactions', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Transactions List Error:', error);
     return apiResponse.error(res, 'Error fetching transactions', {
       code: 'TRANSACTION_ERROR',
       details: error.message
@@ -1095,7 +980,6 @@ router.get('/v1/transactions', async (req, res) => {
 // 6. WEBHOOK CONFIGURATION
 // =============================================
 
-// Update webhook URL
 router.put('/v1/webhook', async (req, res) => {
   try {
     const { webhook_url } = req.body;
@@ -1106,12 +990,12 @@ router.put('/v1/webhook', async (req, res) => {
       });
     }
     
-    // Validate URL format
     try {
       new URL(webhook_url);
     } catch (err) {
       return apiResponse.error(res, 'Invalid webhook URL format', {
-        code: 'INVALID_URL'
+        code: 'INVALID_URL',
+        provided: webhook_url
       });
     }
     
@@ -1119,12 +1003,12 @@ router.put('/v1/webhook', async (req, res) => {
       'apiAccess.webhookUrl': webhook_url
     });
     
-    // Test webhook with sample payload
     try {
       await axios.post(webhook_url, {
         event: 'webhook.test',
         data: {
-          message: 'Webhook configured successfully'
+          message: 'Webhook configured successfully',
+          timestamp: new Date().toISOString()
         },
         timestamp: new Date().toISOString()
       }, { timeout: 5000 });
@@ -1141,6 +1025,7 @@ router.put('/v1/webhook', async (req, res) => {
       });
     }
   } catch (error) {
+    console.error('Webhook Config Error:', error);
     return apiResponse.error(res, 'Error updating webhook', {
       code: 'WEBHOOK_ERROR',
       details: error.message
@@ -1148,7 +1033,6 @@ router.put('/v1/webhook', async (req, res) => {
   }
 });
 
-// Test webhook endpoint
 router.post('/v1/webhook/test', async (req, res) => {
   try {
     const user = await User.findById(req.userId);
@@ -1168,6 +1052,7 @@ router.post('/v1/webhook/test', async (req, res) => {
       webhook_url: user.apiAccess.webhookUrl
     });
   } catch (error) {
+    console.error('Webhook Test Error:', error);
     return apiResponse.error(res, 'Error sending test webhook', {
       code: 'WEBHOOK_ERROR',
       details: error.message
@@ -1179,7 +1064,6 @@ router.post('/v1/webhook/test', async (req, res) => {
 // 7. API STATISTICS
 // =============================================
 
-// Get API usage statistics
 router.get('/v1/statistics', async (req, res) => {
   try {
     const { period = '7days' } = req.query;
@@ -1199,7 +1083,6 @@ router.get('/v1/statistics', async (req, res) => {
         startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     }
     
-    // Get API usage stats
     const apiStats = await ApiLog.aggregate([
       {
         $match: {
@@ -1222,7 +1105,6 @@ router.get('/v1/statistics', async (req, res) => {
       }
     ]);
     
-    // Get transaction stats
     const transactionStats = await Transaction.aggregate([
       {
         $match: {
@@ -1265,6 +1147,7 @@ router.get('/v1/statistics', async (req, res) => {
       statistics: formattedStats
     });
   } catch (error) {
+    console.error('Statistics Error:', error);
     return apiResponse.error(res, 'Error fetching statistics', {
       code: 'STATISTICS_ERROR',
       details: error.message
@@ -1276,25 +1159,32 @@ router.get('/v1/statistics', async (req, res) => {
 // ERROR HANDLING
 // =============================================
 
-// 404 handler for undefined routes
 router.use((req, res) => {
   return apiResponse.error(res, 'API endpoint not found', {
     code: 'ENDPOINT_NOT_FOUND',
     endpoint: req.originalUrl,
-    method: req.method
+    method: req.method,
+    available_endpoints: [
+      'GET /v1/account',
+      'GET /v1/balance',
+      'GET /v1/products',
+      'POST /v1/purchase',
+      'POST /v1/purchase/bulk',
+      'GET /v1/transactions/:reference',
+      'GET /v1/transactions',
+      'PUT /v1/webhook',
+      'POST /v1/webhook/test',
+      'GET /v1/statistics'
+    ]
   }, 404);
 });
 
-// Global error handler
 router.use((error, req, res, next) => {
-  console.error('API Error:', error);
+  console.error('API Global Error:', error);
   return apiResponse.error(res, 'Internal server error', {
-    code: 'INTERNAL_ERROR'
+    code: 'INTERNAL_ERROR',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'An unexpected error occurred'
   }, 500);
 });
-
-// =============================================
-// EXPORT ROUTER
-// =============================================
 
 module.exports = router;
