@@ -1,7 +1,6 @@
 // =============================================
 // ORDER & PRODUCT ROUTES - GHANA MTN DATA PLATFORM
-// For Agents, Dealers, Suppliers & Customers
-// Updated with 6-digit reference numbers
+// Updated with Portal ID display support
 // =============================================
 
 const express = require('express');
@@ -343,41 +342,30 @@ router.post('/products/calculate-price', auth.verifyToken, async (req, res) => {
 // 2. SINGLE ORDER PLACEMENT (WITH 6-DIGIT REFERENCE)
 // =============================================
 
-// DEBUG VERSION - Single Order with detailed logging
+// Single Order with Portal ID support
 router.post('/orders/single',
   auth.verifyToken,
   rateLimit.transaction,
   validate.validateDataPurchase,
   validate.handleValidationErrors,
   wallet.lockWallet,
-  generateReferenceMiddleware, // Updated to generate 6-digit reference
+  generateReferenceMiddleware,
   async (req, res) => {
-    console.log('\n=== ORDER PROCESSING START ===');
-    console.log('Request Body:', JSON.stringify(req.body, null, 2));
-    console.log('User ID:', req.userId);
-    console.log('User Role:', req.user?.role);
-    console.log('Transaction Ref (6-digit):', req.transactionRef);
-    
     let session;
     
     try {
       // Start MongoDB session
-      console.log('Starting MongoDB session...');
       session = await mongoose.startSession();
       session.startTransaction();
-      console.log('Transaction started');
       
       const { productId, beneficiaryNumber } = req.body;
       const userId = req.userId;
-      const reference = req.transactionRef; // Now 6 digits
+      const reference = req.transactionRef; // 6 digits
       
       // Step 1: Get product
-      console.log('\nStep 1: Fetching product:', productId);
       const product = await Product.findById(productId);
-      console.log('Product found:', product ? 'Yes' : 'No');
       
       if (!product) {
-        console.error('Product not found:', productId);
         await session.abortTransaction();
         return res.status(400).json({
           success: false,
@@ -387,7 +375,6 @@ router.post('/orders/single',
       }
       
       if (product.status !== 'active') {
-        console.error('Product not active:', product.status);
         await session.abortTransaction();
         return res.status(400).json({
           success: false,
@@ -396,22 +383,13 @@ router.post('/orders/single',
         });
       }
       
-      console.log('Product details:', {
-        name: product.name,
-        code: product.productCode,
-        capacity: product.capacity
-      });
-      
       // Step 2: Get pricing
-      console.log('\nStep 2: Fetching pricing for product...');
       const pricing = await PriceSetting.findOne({
         product: productId,
         isActive: true
       });
-      console.log('Pricing found:', pricing ? 'Yes' : 'No');
       
       if (!pricing) {
-        console.error('No active pricing for product:', productId);
         await session.abortTransaction();
         return res.status(400).json({
           success: false,
@@ -420,16 +398,8 @@ router.post('/orders/single',
         });
       }
       
-      console.log('Pricing details:', {
-        costPrice: pricing.costPrice,
-        agentPrice: pricing.agentPrice,
-        dealerPrice: pricing.dealerPrice,
-        supplierPrice: pricing.supplierPrice
-      });
-      
       // Step 3: Calculate price based on role
       const userRole = req.user.role || 'agent';
-      console.log('\nStep 3: Calculating price for role:', userRole);
       
       let amount;
       switch (userRole) {
@@ -446,14 +416,10 @@ router.post('/orders/single',
           amount = pricing.agentPrice;
       }
       
-      console.log('Calculated amount:', amount);
-      
       // Step 4: Check wallet balance
-      console.log('\nStep 4: Checking wallet balance...');
       const user = await User.findById(userId).session(session);
       
       if (!user) {
-        console.error('User not found:', userId);
         await session.abortTransaction();
         return res.status(404).json({
           success: false,
@@ -461,12 +427,7 @@ router.post('/orders/single',
         });
       }
       
-      console.log('Current balance:', user.wallet.balance);
-      console.log('Required amount:', amount);
-      console.log('Sufficient balance:', user.wallet.balance >= amount);
-      
       if (user.wallet.balance < amount) {
-        console.error('Insufficient balance');
         await session.abortTransaction();
         return res.status(400).json({
           success: false,
@@ -477,16 +438,13 @@ router.post('/orders/single',
       }
       
       // Step 5: Deduct from wallet
-      console.log('\nStep 5: Deducting from wallet...');
       const balanceBefore = user.wallet.balance;
       user.wallet.balance -= amount;
       await user.save({ session });
-      console.log('New balance:', user.wallet.balance);
       
-      // Step 6: Create transaction record
-      console.log('\nStep 6: Creating transaction record...');
+      // Step 6: Create transaction record with metadata for portal tracking
       const transaction = new Transaction({
-        transactionId: reference, // 6-digit reference
+        transactionId: reference,
         user: userId,
         type: 'data_purchase',
         dataDetails: {
@@ -499,113 +457,85 @@ router.post('/orders/single',
         balanceBefore: balanceBefore,
         balanceAfter: user.wallet.balance,
         status: 'pending',
-        reference: reference, // 6-digit reference
-        paymentMethod: 'wallet'
+        reference: reference,
+        paymentMethod: 'wallet',
+        // Initialize metadata for portal tracking
+        metadata: {
+          exportReady: true,
+          portalStatus: 'pending'
+        }
       });
       
       await transaction.save({ session });
-      console.log('Transaction created with 6-digit ID:', transaction.transactionId);
       
       // Step 7: Create wallet transaction
-      console.log('\nStep 7: Creating wallet transaction...');
-      const walletTx = await WalletTransaction.create([{
+      await WalletTransaction.create([{
         user: userId,
         type: 'debit',
         amount: amount,
         balanceBefore: balanceBefore,
         balanceAfter: user.wallet.balance,
         purpose: 'purchase',
-        reference: reference, // 6-digit reference
+        reference: reference,
         status: 'completed',
-        description: `Purchase of ${product.name} for ${beneficiaryNumber}`
+        description: `Purchase of ${product.name} for ${beneficiaryNumber}`,
+        relatedTransaction: transaction._id
       }], { session });
-      console.log('Wallet transaction created');
       
-      // Step 8: Simulate MTN API call (for now, just mark as successful)
-      console.log('\nStep 8: Processing with MTN API (simulated)...');
-      transaction.status = 'pending';
-      transaction.completedAt = new Date();
-      await transaction.save({ session });
-      console.log('Transaction marked as successful');
-      
-      // Step 9: Update product stats if they exist
+      // Step 8: Update product stats
       if (product.stats) {
-        console.log('\nStep 9: Updating product stats...');
         product.stats.totalSold = (product.stats.totalSold || 0) + 1;
         product.stats.totalRevenue = (product.stats.totalRevenue || 0) + amount;
         await product.save({ session });
-        console.log('Product stats updated');
       }
       
-      // Step 10: Commit transaction
-      console.log('\nStep 10: Committing transaction...');
+      // Step 9: Commit transaction
       await session.commitTransaction();
-      console.log('Transaction committed successfully');
       
-      // Step 11: Send notification (outside of transaction)
-      console.log('\nStep 11: Creating notification...');
+      // Step 10: Send notification
       try {
         await Notification.create({
           user: userId,
-          title: 'Data Purchase Successful',
-          message: `Your purchase of ${product.name} for ${beneficiaryNumber} was successful`,
-          type: 'success',
+          title: 'Data Purchase Initiated',
+          message: `Your purchase of ${product.name} for ${beneficiaryNumber} is being processed`,
+          type: 'info',
           category: 'transaction',
           relatedTransaction: transaction._id
         });
-        console.log('Notification created');
       } catch (notifError) {
         console.error('Notification error (non-critical):', notifError.message);
       }
       
       // Send success response
-      console.log('\n=== ORDER PROCESSING COMPLETE ===\n');
       res.json({
         success: true,
         message: 'Order placed successfully',
         data: {
-          transactionId: reference, // 6-digit reference
+          transactionId: reference,
           product: product.name,
           beneficiary: beneficiaryNumber,
           amount: amount,
-          status: 'successful',
-          balance: user.wallet.balance
+          status: 'pending',
+          balance: user.wallet.balance,
+          metadata: {
+            portalId: null, // Will be updated when exported to portal
+            portalStatus: 'pending'
+          }
         }
       });
       
     } catch (error) {
-      console.error('\n=== ERROR OCCURRED ===');
-      console.error('Error Type:', error.name);
-      console.error('Error Message:', error.message);
-      console.error('Error Stack:', error.stack);
-      
       if (session) {
-        console.log('Aborting transaction...');
         await session.abortTransaction();
       }
       
-      // Send detailed error in development, generic in production
-      const errorResponse = {
+      res.status(500).json({
         success: false,
-        message: 'Error processing order'
-      };
-      
-      // In development, add more details
-      if (process.env.NODE_ENV !== 'production') {
-        errorResponse.error = error.message;
-        errorResponse.stack = error.stack;
-        errorResponse.details = {
-          errorName: error.name,
-          userId: req.userId,
-          productId: req.body.productId,
-          beneficiary: req.body.beneficiaryNumber
-        };
-      }
-      
-      res.status(500).json(errorResponse);
+        message: 'Error processing order',
+        error: process.env.NODE_ENV !== 'production' ? error.message : undefined
+      });
     } finally {
       if (session) {
-        console.log('Ending session...');
         session.endSession();
       }
     }
@@ -613,10 +543,9 @@ router.post('/orders/single',
 );
 
 // =============================================
-// 3. BULK ORDER PLACEMENT (WITH 6-DIGIT REFERENCES)
+// 3. BULK ORDER PLACEMENT (WITH 6-DIGIT REFERENCES AND PORTAL SUPPORT)
 // =============================================
 
-// Place bulk data order
 router.post('/orders/bulk',
   auth.verifyToken,
   rateLimit.transaction,
@@ -626,7 +555,7 @@ router.post('/orders/bulk',
     session.startTransaction();
     
     try {
-      const { orders } = req.body; // Array of { productId, beneficiaryNumber, quantity }
+      const { orders } = req.body;
       const userId = req.userId;
       
       if (!orders || !Array.isArray(orders) || orders.length === 0) {
@@ -736,13 +665,12 @@ router.post('/orders/bulk',
       
       // Process each order
       for (const orderDetail of orderDetails) {
-        // Generate unique 6-digit reference for each order
         const orderRef = await generateUniqueReference('');
         
         try {
-          // Create transaction for each order
+          // Create transaction with metadata for portal tracking
           const transaction = new Transaction({
-            transactionId: orderRef, // 6-digit reference
+            transactionId: orderRef,
             user: userId,
             type: 'data_purchase',
             dataDetails: {
@@ -754,20 +682,15 @@ router.post('/orders/bulk',
             },
             amount: orderDetail.amount,
             status: 'pending',
-            reference: orderRef, // 6-digit reference
+            reference: orderRef,
             paymentMethod: 'wallet',
             metadata: {
-              bulkReference: bulkReference // BLK + 6 digits
+              bulkReference: bulkReference,
+              exportReady: true,
+              portalStatus: 'pending'
             }
           });
           
-          
-          await transaction.save({ session });
-          
-          // TODO: Call MTN API for each number
-          // For now, simulate success
-          transaction.status = 'pending';
-          transaction.completedAt = new Date();
           await transaction.save({ session });
           
           // Update product stats
@@ -778,12 +701,16 @@ router.post('/orders/bulk',
           }
           
           processedOrders.push({
-            transactionId: orderRef, // 6-digit reference
+            transactionId: orderRef,
             product: orderDetail.product.name,
             beneficiary: orderDetail.beneficiaryNumber,
             quantity: orderDetail.quantity,
             amount: orderDetail.amount,
-            status: 'successful'
+            status: 'pending',
+            metadata: {
+              portalId: null,
+              portalStatus: 'pending'
+            }
           });
         } catch (error) {
           failedOrders.push({
@@ -802,9 +729,14 @@ router.post('/orders/bulk',
         balanceBefore: balanceBefore,
         balanceAfter: user.wallet.balance,
         purpose: 'purchase',
-        reference: bulkReference, // BLK + 6 digits
+        reference: bulkReference,
         status: 'completed',
-        description: `Bulk purchase of ${orders.length} items`
+        description: `Bulk purchase of ${orders.length} items`,
+        metadata: {
+          transactionIds: processedOrders.map(o => o.transactionId),
+          count: processedOrders.length,
+          bulkReference: bulkReference
+        }
       }], { session });
       
       await session.commitTransaction();
@@ -813,8 +745,8 @@ router.post('/orders/bulk',
       await Notification.create({
         user: userId,
         title: 'Bulk Order Processed',
-        message: `Your bulk order of ${processedOrders.length} items has been processed`,
-        type: 'success',
+        message: `Your bulk order of ${processedOrders.length} items has been initiated`,
+        type: 'info',
         category: 'transaction',
         metadata: {
           bulkReference: bulkReference
@@ -825,7 +757,7 @@ router.post('/orders/bulk',
         success: true,
         message: 'Bulk order processed',
         data: {
-          bulkReference: bulkReference, // BLK + 6 digits
+          bulkReference: bulkReference,
           totalAmount: totalAmount,
           processedCount: processedOrders.length,
           failedCount: failedOrders.length,
@@ -847,57 +779,11 @@ router.post('/orders/bulk',
   }
 );
 
-// Upload CSV for bulk order
-router.post('/orders/bulk/csv',
-  auth.verifyToken,
-  async (req, res) => {
-    try {
-      const { csvData } = req.body;
-      
-      // Parse CSV data
-      // Expected format: productCode,beneficiaryNumber,quantity
-      const lines = csvData.split('\n').filter(line => line.trim());
-      const orders = [];
-      
-      for (let i = 1; i < lines.length; i++) { // Skip header
-        const [productCode, beneficiaryNumber, quantity] = lines[i].split(',').map(s => s.trim());
-        
-        const product = await Product.findOne({ productCode });
-        if (!product) {
-          return res.status(400).json({
-            success: false,
-            message: `Product not found: ${productCode}`,
-            line: i + 1
-          });
-        }
-        
-        orders.push({
-          productId: product._id,
-          beneficiaryNumber,
-          quantity: parseInt(quantity) || 1
-        });
-      }
-      
-      // Process as bulk order
-      req.body.orders = orders;
-      
-      // Call the bulk order handler
-      return router.post('/orders/bulk', auth.verifyToken, rateLimit.transaction, wallet.lockWallet)(req, res);
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message: 'Error processing CSV',
-        error: error.message
-      });
-    }
-  }
-);
-
 // =============================================
-// 4. ORDER HISTORY & TRACKING
+// 4. ORDER HISTORY & TRACKING WITH PORTAL ID
 // =============================================
 
-// Get user's order history
+// Get user's order history - UPDATED WITH PORTAL ID
 router.get('/orders',
   auth.verifyToken,
   async (req, res) => {
@@ -925,11 +811,13 @@ router.get('/orders',
         if (endDate) filter.createdAt.$lte = new Date(endDate);
       }
       
+      // UPDATED: Include metadata.portalId in search
       if (search) {
         filter.$or = [
           { transactionId: { $regex: search, $options: 'i' } },
           { reference: { $regex: search, $options: 'i' } },
-          { 'dataDetails.beneficiaryNumber': { $regex: search, $options: 'i' } }
+          { 'dataDetails.beneficiaryNumber': { $regex: search, $options: 'i' } },
+          { 'metadata.portalId': { $regex: search, $options: 'i' } }
         ];
       }
       
@@ -942,10 +830,11 @@ router.get('/orders',
       
       const total = await Transaction.countDocuments(filter);
       
-      // Format orders
+      // UPDATED: Include full metadata in response
       const formattedOrders = orders.map(order => ({
         id: order._id,
         transactionId: order.transactionId,
+        createdAt: order.createdAt,
         date: order.createdAt,
         product: order.dataDetails?.product?.name,
         capacity: order.dataDetails?.capacity,
@@ -953,7 +842,19 @@ router.get('/orders',
         amount: order.amount,
         status: order.status,
         reference: order.reference,
-        completedAt: order.completedAt
+        completedAt: order.completedAt,
+        // Include metadata with portal information
+        metadata: {
+          portalId: order.metadata?.portalId,
+          exportId: order.metadata?.exportId,
+          batchId: order.metadata?.batchId,
+          portalStatus: order.metadata?.portalStatus,
+          portalSubmittedAt: order.metadata?.portalSubmittedAt,
+          portalCompletedAt: order.metadata?.portalCompletedAt,
+          estimatedCompletion: order.metadata?.estimatedCompletion,
+          processingMinutes: order.metadata?.processingMinutes,
+          bulkReference: order.metadata?.bulkReference
+        }
       }));
       
       res.json({
@@ -975,7 +876,7 @@ router.get('/orders',
   }
 );
 
-// Get single order details
+// Get single order details - UPDATED WITH PORTAL ID
 router.get('/orders/:orderId',
   auth.verifyToken,
   async (req, res) => {
@@ -1001,9 +902,25 @@ router.get('/orders/:orderId',
         });
       }
       
+      // Format the order with full metadata
+      const formattedOrder = {
+        ...order,
+        metadata: {
+          portalId: order.metadata?.portalId,
+          exportId: order.metadata?.exportId,
+          batchId: order.metadata?.batchId,
+          portalStatus: order.metadata?.portalStatus,
+          portalSubmittedAt: order.metadata?.portalSubmittedAt,
+          portalCompletedAt: order.metadata?.portalCompletedAt,
+          estimatedCompletion: order.metadata?.estimatedCompletion,
+          processingMinutes: order.metadata?.processingMinutes,
+          bulkReference: order.metadata?.bulkReference
+        }
+      };
+      
       res.json({
         success: true,
-        data: order
+        data: formattedOrder
       });
     } catch (error) {
       res.status(500).json({
@@ -1015,7 +932,7 @@ router.get('/orders/:orderId',
   }
 );
 
-// Track order status
+// Track order status - UPDATED WITH PORTAL TRACKING
 router.get('/orders/:orderId/track',
   auth.verifyToken,
   async (req, res) => {
@@ -1039,7 +956,7 @@ router.get('/orders/:orderId/track',
         });
       }
       
-      // Create tracking timeline
+      // Create enhanced tracking timeline with portal status
       const timeline = [
         {
           status: 'initiated',
@@ -1052,20 +969,34 @@ router.get('/orders/:orderId/track',
           message: 'Processing payment',
           timestamp: order.createdAt,
           completed: true
-        },
-        {
-          status: 'sending',
-          message: 'Sending data to beneficiary',
-          timestamp: order.processedAt || order.createdAt,
-          completed: order.status !== 'pending'
-        },
-        {
-          status: 'completed',
-          message: 'Data delivered successfully',
-          timestamp: order.completedAt,
-          completed: order.status === 'successful'
         }
       ];
+      
+      // Add portal submission step if applicable
+      if (order.metadata?.portalId) {
+        timeline.push({
+          status: 'portal_submitted',
+          message: `Submitted to MTN Portal (ID: ${order.metadata.portalId})`,
+          timestamp: order.metadata.portalSubmittedAt || order.exportedAt,
+          completed: true
+        });
+      }
+      
+      // Add sending step
+      timeline.push({
+        status: 'sending',
+        message: 'Sending data to beneficiary',
+        timestamp: order.processedAt || order.createdAt,
+        completed: order.status !== 'pending'
+      });
+      
+      // Add completion step
+      timeline.push({
+        status: 'completed',
+        message: 'Data delivered successfully',
+        timestamp: order.completedAt,
+        completed: order.status === 'successful'
+      });
       
       res.json({
         success: true,
@@ -1074,6 +1005,8 @@ router.get('/orders/:orderId/track',
           currentStatus: order.status,
           beneficiary: order.dataDetails?.beneficiaryNumber,
           amount: order.amount,
+          portalId: order.metadata?.portalId,
+          portalStatus: order.metadata?.portalStatus,
           timeline: timeline
         }
       });
@@ -1117,7 +1050,7 @@ router.get('/orders/stats/summary',
       const stats = await Transaction.aggregate([
         {
           $match: {
-            user: mongoose.Types.ObjectId(userId),
+            user: new mongoose.Types.ObjectId(userId),
             type: 'data_purchase',
             createdAt: { $gte: startDate }
           }
@@ -1135,6 +1068,15 @@ router.get('/orders/stats/summary',
             },
             pendingOrders: {
               $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] }
+            },
+            sentOrders: {
+              $sum: { $cond: [{ $eq: ['$status', 'sent'] }, 1, 0] }
+            },
+            // Count orders with portal IDs
+            portalSubmitted: {
+              $sum: {
+                $cond: [{ $ne: ['$metadata.portalId', null] }, 1, 0]
+              }
             }
           }
         }
@@ -1144,7 +1086,7 @@ router.get('/orders/stats/summary',
       const topProducts = await Transaction.aggregate([
         {
           $match: {
-            user: mongoose.Types.ObjectId(userId),
+            user: new mongoose.Types.ObjectId(userId),
             type: 'data_purchase',
             status: 'successful',
             createdAt: { $gte: startDate }
@@ -1161,7 +1103,7 @@ router.get('/orders/stats/summary',
         { $limit: 5 },
         {
           $lookup: {
-            from: 'products',
+            from: 'product_resellers',
             localField: '_id',
             foreignField: '_id',
             as: 'product'
@@ -1174,7 +1116,7 @@ router.get('/orders/stats/summary',
       const frequentBeneficiaries = await Transaction.aggregate([
         {
           $match: {
-            user: mongoose.Types.ObjectId(userId),
+            user: new mongoose.Types.ObjectId(userId),
             type: 'data_purchase',
             status: 'successful',
             createdAt: { $gte: startDate }
@@ -1199,7 +1141,9 @@ router.get('/orders/stats/summary',
             totalSpent: 0,
             successfulOrders: 0,
             failedOrders: 0,
-            pendingOrders: 0
+            pendingOrders: 0,
+            sentOrders: 0,
+            portalSubmitted: 0
           },
           topProducts: topProducts.map(p => ({
             name: p.product.name,
@@ -1232,7 +1176,7 @@ router.post('/orders/:orderId/reorder',
   async (req, res) => {
     try {
       const { orderId } = req.params;
-      const { beneficiaryNumber } = req.body; // Optional new beneficiary
+      const { beneficiaryNumber } = req.body;
       const userId = req.userId;
       
       // Find original order
@@ -1261,13 +1205,7 @@ router.post('/orders/:orderId/reorder',
       req.transactionRef = await generateUniqueReference('');
       
       // Forward to single order handler
-      return router.post('/orders/single', 
-        auth.verifyToken, 
-        rateLimit.transaction, 
-        validate.validateDataPurchase,
-        validate.handleValidationErrors,
-        wallet.lockWallet
-      )(req, res);
+      next();
     } catch (error) {
       res.status(500).json({
         success: false,
@@ -1289,7 +1227,7 @@ router.get('/beneficiaries/frequent',
       const beneficiaries = await Transaction.aggregate([
         {
           $match: {
-            user: mongoose.Types.ObjectId(userId),
+            user: new mongoose.Types.ObjectId(userId),
             type: 'data_purchase',
             status: 'successful'
           }
@@ -1326,7 +1264,7 @@ router.get('/beneficiaries/frequent',
 );
 
 // =============================================
-// 7. DOWNLOAD RECEIPTS
+// 7. DOWNLOAD RECEIPTS WITH PORTAL INFO
 // =============================================
 
 // Get order receipt
@@ -1356,7 +1294,7 @@ router.get('/orders/:orderId/receipt',
       }
       
       const receipt = {
-        receiptNumber: order.transactionId, // 6-digit reference
+        receiptNumber: order.transactionId,
         date: order.createdAt,
         customer: {
           name: order.user.fullName,
@@ -1371,7 +1309,8 @@ router.get('/orders/:orderId/receipt',
           status: order.status,
           paymentMethod: order.paymentMethod
         },
-        reference: order.reference, // 6-digit reference
+        reference: order.reference,
+        portalId: order.metadata?.portalId,
         completedAt: order.completedAt
       };
       
@@ -1388,6 +1327,458 @@ router.get('/orders/:orderId/receipt',
     }
   }
 );
+
+// =============================================
+// TODAY'S STATISTICS ENDPOINT
+// =============================================
+
+// Get today's statistics for the user
+router.get('/profile/today-stats', auth.verifyToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    // Get start and end of today in user's timezone (Ghana)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    // Fetch today's orders (data purchases)
+    const todayOrdersPromise = Transaction.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          type: 'data_purchase',
+          createdAt: {
+            $gte: today,
+            $lt: tomorrow
+          }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalOrders: { $sum: 1 },
+          totalSpent: { $sum: '$amount' },
+          successfulOrders: {
+            $sum: { $cond: [{ $eq: ['$status', 'successful'] }, 1, 0] }
+          },
+          pendingOrders: {
+            $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] }
+          },
+          sentOrders: {
+            $sum: { $cond: [{ $eq: ['$status', 'sent'] }, 1, 0] }
+          },
+          failedOrders: {
+            $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
+          },
+          portalSubmitted: {
+            $sum: {
+              $cond: [{ $ne: ['$metadata.portalId', null] }, 1, 0]
+            }
+          }
+        }
+      }
+    ]);
+    
+    // Fetch today's deposits/funding by admin
+    const todayDepositsPromise = WalletTransaction.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          type: 'credit',
+          purpose: { $in: ['funding', 'adjustment'] },
+          createdAt: {
+            $gte: today,
+            $lt: tomorrow
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'reseller_users',
+          localField: 'createdBy',
+          foreignField: '_id',
+          as: 'creator'
+        }
+      },
+      {
+        $unwind: {
+          path: '$creator',
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      {
+        $match: {
+          $or: [
+            { 'creator.role': 'admin' },
+            { createdBy: { $exists: false } }
+          ]
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalDeposits: { $sum: '$amount' },
+          depositCount: { $sum: 1 },
+          deposits: {
+            $push: {
+              amount: '$amount',
+              time: '$createdAt',
+              description: '$description',
+              reference: '$reference'
+            }
+          }
+        }
+      }
+    ]);
+    
+    // Fetch recent orders for detailed view
+    const recentOrdersPromise = Transaction.find({
+      user: userId,
+      type: 'data_purchase',
+      createdAt: {
+        $gte: today,
+        $lt: tomorrow
+      }
+    })
+    .populate('dataDetails.product', 'name capacity')
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .lean();
+    
+    // Execute all promises in parallel
+    const [todayOrders, todayDeposits, recentOrders] = await Promise.all([
+      todayOrdersPromise,
+      todayDepositsPromise,
+      recentOrdersPromise
+    ]);
+    
+    // Get current wallet balance for context
+    const user = await User.findById(userId).select('wallet.balance fullName email').lean();
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+    
+    // Calculate hourly distribution of orders
+    const hourlyDistribution = await Transaction.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          type: 'data_purchase',
+          createdAt: {
+            $gte: today,
+            $lt: tomorrow
+          }
+        }
+      },
+      {
+        $group: {
+          _id: { $hour: '$createdAt' },
+          count: { $sum: 1 },
+          amount: { $sum: '$amount' }
+        }
+      },
+      {
+        $sort: { '_id': 1 }
+      }
+    ]);
+    
+    // Format the response
+    const stats = {
+      // User Info
+      user: {
+        fullName: user.fullName || 'N/A',
+        email: user.email || 'N/A',
+        currentBalance: user.wallet?.balance || 0
+      },
+      
+      // Date Info
+      date: {
+        today: today.toISOString().split('T')[0],
+        timezone: 'Africa/Accra'
+      },
+      
+      // Order Statistics
+      orders: {
+        total: todayOrders[0]?.totalOrders || 0,
+        successful: todayOrders[0]?.successfulOrders || 0,
+        pending: todayOrders[0]?.pendingOrders || 0,
+        sent: todayOrders[0]?.sentOrders || 0,
+        failed: todayOrders[0]?.failedOrders || 0,
+        portalSubmitted: todayOrders[0]?.portalSubmitted || 0,
+        totalAmount: todayOrders[0]?.totalSpent || 0,
+        formattedAmount: `GHS ${(todayOrders[0]?.totalSpent || 0).toFixed(2)}`
+      },
+      
+      // Deposit Statistics
+      deposits: {
+        totalAmount: todayDeposits[0]?.totalDeposits || 0,
+        formattedAmount: `GHS ${(todayDeposits[0]?.totalDeposits || 0).toFixed(2)}`,
+        count: todayDeposits[0]?.depositCount || 0,
+        transactions: todayDeposits[0]?.deposits?.map(dep => ({
+          amount: `GHS ${dep.amount.toFixed(2)}`,
+          time: dep.time,
+          description: dep.description || 'Wallet funding',
+          reference: dep.reference
+        })) || []
+      },
+      
+      // Recent Orders Detail with Portal IDs
+      recentOrders: recentOrders.map(order => ({
+        transactionId: order.transactionId,
+        beneficiary: order.dataDetails?.beneficiaryNumber,
+        product: order.dataDetails?.product?.name || 'N/A',
+        capacity: order.dataDetails?.capacity,
+        amount: `GHS ${order.amount.toFixed(2)}`,
+        status: order.status,
+        time: order.createdAt,
+        portalId: order.metadata?.portalId
+      })),
+      
+      // Hourly Distribution
+      hourlyActivity: hourlyDistribution.map(hour => ({
+        hour: `${hour._id}:00`,
+        orders: hour.count,
+        amount: hour.amount
+      })),
+      
+      // Summary
+      summary: {
+        netActivity: (todayDeposits[0]?.totalDeposits || 0) - (todayOrders[0]?.totalSpent || 0),
+        formattedNetActivity: `GHS ${((todayDeposits[0]?.totalDeposits || 0) - (todayOrders[0]?.totalSpent || 0)).toFixed(2)}`,
+        averageOrderValue: todayOrders[0]?.totalOrders > 0 
+          ? `GHS ${(todayOrders[0].totalSpent / todayOrders[0].totalOrders).toFixed(2)}`
+          : 'GHS 0.00',
+        successRate: todayOrders[0]?.totalOrders > 0
+          ? `${((todayOrders[0].successfulOrders / todayOrders[0].totalOrders) * 100).toFixed(1)}%`
+          : '0%'
+      }
+    };
+    
+    res.json({
+      success: true,
+      message: 'Today\'s statistics retrieved successfully',
+      data: stats
+    });
+    
+  } catch (error) {
+    console.error('Error fetching today\'s statistics:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching today\'s statistics',
+      error: error.message
+    });
+  }
+});
+
+// Get statistics for a date range
+router.get('/profile/date-range-stats', auth.verifyToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { startDate, endDate } = req.query;
+    
+    if (!startDate || !endDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Start date and end date are required'
+      });
+    }
+    
+    const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+    
+    // Validate date range
+    if (start > end) {
+      return res.status(400).json({
+        success: false,
+        message: 'Start date cannot be after end date'
+      });
+    }
+    
+    if ((end - start) > 90 * 24 * 60 * 60 * 1000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Date range cannot exceed 90 days'
+      });
+    }
+    
+    const filter = { 
+      user: new mongoose.Types.ObjectId(userId),
+      type: 'data_purchase',
+      createdAt: {
+        $gte: start,
+        $lte: end
+      }
+    };
+    
+    // Fetch orders for date range
+    const ordersStatsPromise = Transaction.aggregate([
+      {
+        $match: filter
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: {
+              format: '%Y-%m-%d',
+              date: '$createdAt'
+            }
+          },
+          totalOrders: { $sum: 1 },
+          totalSpent: { $sum: '$amount' },
+          successfulOrders: {
+            $sum: { $cond: [{ $eq: ['$status', 'successful'] }, 1, 0] }
+          }
+        }
+      },
+      {
+        $sort: { '_id': 1 }
+      }
+    ]);
+    
+    // Fetch deposits for date range
+    const depositsStatsPromise = WalletTransaction.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          type: 'credit',
+          purpose: { $in: ['funding', 'adjustment'] },
+          createdAt: {
+            $gte: start,
+            $lte: end
+          }
+        }
+      },
+      {
+        $lookup: {
+          from: 'reseller_users',
+          localField: 'createdBy',
+          foreignField: '_id',
+          as: 'creator'
+        }
+      },
+      {
+        $unwind: {
+          path: '$creator',
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      {
+        $match: {
+          $or: [
+            { 'creator.role': 'admin' },
+            { createdBy: { $exists: false } }
+          ]
+        }
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: {
+              format: '%Y-%m-%d',
+              date: '$createdAt'
+            }
+          },
+          totalDeposits: { $sum: '$amount' },
+          depositCount: { $sum: 1 }
+        }
+      },
+      {
+        $sort: { '_id': 1 }
+      }
+    ]);
+    
+    const [ordersStats, depositsStats] = await Promise.all([
+      ordersStatsPromise,
+      depositsStatsPromise
+    ]);
+    
+    // Combine stats by date
+    const dailyStats = {};
+    
+    // Add orders data
+    ordersStats.forEach(day => {
+      dailyStats[day._id] = {
+        date: day._id,
+        orders: {
+          total: day.totalOrders,
+          successful: day.successfulOrders,
+          amount: day.totalSpent
+        },
+        deposits: {
+          amount: 0,
+          count: 0
+        }
+      };
+    });
+    
+    // Add deposits data
+    depositsStats.forEach(day => {
+      if (!dailyStats[day._id]) {
+        dailyStats[day._id] = {
+          date: day._id,
+          orders: {
+            total: 0,
+            successful: 0,
+            amount: 0
+          },
+          deposits: {
+            amount: 0,
+            count: 0
+          }
+        };
+      }
+      dailyStats[day._id].deposits = {
+        amount: day.totalDeposits,
+        count: day.depositCount
+      };
+    });
+    
+    // Calculate totals
+    const totals = {
+      totalOrders: ordersStats.reduce((sum, day) => sum + day.totalOrders, 0),
+      totalSpent: ordersStats.reduce((sum, day) => sum + day.totalSpent, 0),
+      totalDeposits: depositsStats.reduce((sum, day) => sum + day.totalDeposits, 0),
+      totalDepositCount: depositsStats.reduce((sum, day) => sum + day.depositCount, 0)
+    };
+    
+    res.json({
+      success: true,
+      data: {
+        dateRange: {
+          start: start.toISOString().split('T')[0],
+          end: end.toISOString().split('T')[0],
+          days: Math.ceil((end - start) / (1000 * 60 * 60 * 24))
+        },
+        totals: {
+          orders: totals.totalOrders,
+          ordersAmount: `GHS ${totals.totalSpent.toFixed(2)}`,
+          deposits: totals.totalDepositCount,
+          depositsAmount: `GHS ${totals.totalDeposits.toFixed(2)}`,
+          netActivity: `GHS ${(totals.totalDeposits - totals.totalSpent).toFixed(2)}`
+        },
+        dailyBreakdown: Object.values(dailyStats).sort((a, b) => 
+          new Date(a.date) - new Date(b.date)
+        )
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error fetching date range statistics:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching date range statistics',
+      error: error.message
+    });
+  }
+});
 
 // =============================================
 // EXPORT ROUTER

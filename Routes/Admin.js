@@ -3737,6 +3737,691 @@ router.post('/notifications/broadcast', async (req, res) => {
   }
 });
 
+
+// =============================================
+// PORTAL ID TRACKING ROUTES
+// Add these to your admin API routes file
+// =============================================
+
+// 1. Enter Portal ID for a batch
+router.post('/batches/:batchId/portal-id', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { batchId } = req.params;
+    const { portalId, estimatedMinutes = 30, notes } = req.body;
+    
+    if (!portalId) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        message: 'Portal ID is required'
+      });
+    }
+    
+    // Check if portal ID already exists
+    const existingPortal = await Batch.findOne({
+      'portalTracking.portalId': portalId
+    });
+    
+    if (existingPortal && existingPortal.batchId !== batchId) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        message: 'This Portal ID is already assigned to another batch',
+        existingBatch: existingPortal.batchId
+      });
+    }
+    
+    // Find and update the batch
+    const batch = await Batch.findOneAndUpdate(
+      { 
+        $or: [
+          { batchId: batchId },
+          { _id: batchId }
+        ]
+      },
+      {
+        $set: {
+          'portalTracking.portalId': portalId,
+          'portalTracking.enteredBy': req.userId,
+          'portalTracking.enteredAt': new Date(),
+          'portalTracking.estimatedCompletionTime': new Date(Date.now() + estimatedMinutes * 60000),
+          'portalTracking.status': 'submitted',
+          'portalTracking.notes': notes,
+          'portalTracking.lastUpdated': new Date(),
+          'portalTracking.lastUpdatedBy': req.userId
+        },
+        $push: {
+          'portalTracking.updateHistory': {
+            status: 'submitted',
+            notes: `Portal ID ${portalId} entered`,
+            updatedBy: req.userId,
+            updatedAt: new Date()
+          }
+        }
+      },
+      { new: true, session }
+    );
+    
+    if (!batch) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'Batch not found'
+      });
+    }
+    
+    // Update all transactions in this batch
+    const orderIds = batch.orders.map(o => o.transactionId);
+    
+    await Transaction.updateMany(
+      { transactionId: { $in: orderIds } },
+      {
+        $set: {
+          'metadata.portalId': portalId,
+          'metadata.portalSubmittedAt': new Date(),
+          'metadata.portalStatus': 'submitted'
+        }
+      },
+      { session }
+    );
+    
+    // Create notification for users
+    const affectedUsers = await Transaction.distinct('user', {
+      transactionId: { $in: orderIds }
+    });
+    
+    const notifications = affectedUsers.map(userId => ({
+      user: userId,
+      title: 'Orders Submitted to Portal',
+      message: `Your orders have been submitted to the MTN portal (ID: ${portalId}). Estimated completion in ${estimatedMinutes} minutes.`,
+      type: 'info',
+      category: 'transaction',
+      metadata: { portalId, batchId: batch.batchId }
+    }));
+    
+    await Notification.insertMany(notifications, { session });
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    res.json({
+      success: true,
+      message: 'Portal ID entered successfully',
+      data: {
+        batchId: batch.batchId,
+        portalId: portalId,
+        ordersUpdated: orderIds.length,
+        estimatedCompletion: new Date(Date.now() + estimatedMinutes * 60000),
+        status: 'submitted'
+      }
+    });
+    
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error entering portal ID',
+      error: error.message
+    });
+  }
+});
+
+// 2. Update Portal Status
+router.patch('/portal/:portalId/status', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { portalId } = req.params;
+    const { status, notes, completionTime } = req.body;
+    
+    const validStatuses = ['pending', 'submitted', 'processing', 'completed', 'failed'];
+    if (!validStatuses.includes(status)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid status',
+        validStatuses
+      });
+    }
+    
+    // Find batch with this portal ID
+    const batch = await Batch.findOne({
+      'portalTracking.portalId': portalId
+    });
+    
+    if (!batch) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({
+        success: false,
+        message: 'No batch found with this Portal ID'
+      });
+    }
+    
+    // Update batch portal tracking
+    const updateData = {
+      'portalTracking.status': status,
+      'portalTracking.lastUpdated': new Date(),
+      'portalTracking.lastUpdatedBy': req.userId
+    };
+    
+    if (notes) updateData['portalTracking.notes'] = notes;
+    
+    if (status === 'completed') {
+      updateData['portalTracking.actualCompletionTime'] = completionTime || new Date();
+    }
+    
+    await Batch.findByIdAndUpdate(
+      batch._id,
+      {
+        $set: updateData,
+        $push: {
+          'portalTracking.updateHistory': {
+            status: status,
+            notes: notes || `Status updated to ${status}`,
+            updatedBy: req.userId,
+            updatedAt: new Date()
+          }
+        }
+      },
+      { session }
+    );
+    
+    // Update transaction statuses
+    const orderIds = batch.orders.map(o => o.transactionId);
+    
+    let transactionUpdate = {
+      'metadata.portalStatus': status
+    };
+    
+    if (status === 'completed') {
+      transactionUpdate['metadata.portalCompletedAt'] = completionTime || new Date();
+      transactionUpdate['status'] = 'successful';
+      transactionUpdate['completedAt'] = new Date();
+    } else if (status === 'failed') {
+      transactionUpdate['status'] = 'failed';
+      transactionUpdate['failureReason'] = 'Portal processing failed';
+    }
+    
+    await Transaction.updateMany(
+      { transactionId: { $in: orderIds } },
+      { $set: transactionUpdate },
+      { session }
+    );
+    
+    // Handle wallet refunds if failed
+    if (status === 'failed') {
+      const transactions = await Transaction.find({
+        transactionId: { $in: orderIds }
+      }).session(session);
+      
+      for (const transaction of transactions) {
+        const user = await User.findById(transaction.user).session(session);
+        if (user) {
+          const balanceBefore = user.wallet.balance;
+          user.wallet.balance += transaction.amount;
+          await user.save({ session });
+          
+          await WalletTransaction.create([{
+            user: transaction.user,
+            type: 'credit',
+            amount: transaction.amount,
+            balanceBefore: balanceBefore,
+            balanceAfter: user.wallet.balance,
+            purpose: 'refund',
+            reference: 'REF_PORTAL_' + Date.now(),
+            status: 'completed',
+            description: `Refund for failed portal processing (Portal ID: ${portalId})`,
+            relatedTransaction: transaction._id
+          }], { session });
+        }
+      }
+    }
+    
+    // Send notifications
+    const affectedUsers = await Transaction.distinct('user', {
+      transactionId: { $in: orderIds }
+    });
+    
+    let notificationMessage = '';
+    let notificationType = 'info';
+    
+    switch (status) {
+      case 'processing':
+        notificationMessage = `Your orders (Portal ID: ${portalId}) are being processed by MTN.`;
+        break;
+      case 'completed':
+        notificationMessage = `Your orders (Portal ID: ${portalId}) have been successfully completed!`;
+        notificationType = 'success';
+        break;
+      case 'failed':
+        notificationMessage = `Your orders (Portal ID: ${portalId}) failed. Refunds have been processed.`;
+        notificationType = 'error';
+        break;
+      default:
+        notificationMessage = `Portal status updated to ${status} (Portal ID: ${portalId})`;
+    }
+    
+    const notifications = affectedUsers.map(userId => ({
+      user: userId,
+      title: 'Portal Update',
+      message: notificationMessage,
+      type: notificationType,
+      category: 'transaction',
+      metadata: { portalId, status }
+    }));
+    
+    await Notification.insertMany(notifications, { session });
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    res.json({
+      success: true,
+      message: `Portal status updated to ${status}`,
+      data: {
+        portalId,
+        batchId: batch.batchId,
+        status,
+        ordersUpdated: orderIds.length,
+        refundsProcessed: status === 'failed' ? orderIds.length : 0
+      }
+    });
+    
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error updating portal status',
+      error: error.message
+    });
+  }
+});
+
+// 3. Get Portal Tracking Status
+router.get('/portal/:portalId', async (req, res) => {
+  try {
+    const { portalId } = req.params;
+    
+    // Find batch with this portal ID
+    const batch = await Batch.findOne({
+      'portalTracking.portalId': portalId
+    })
+    .populate('exportedBy', 'fullName')
+    .populate('portalTracking.enteredBy', 'fullName')
+    .populate('portalTracking.lastUpdatedBy', 'fullName');
+    
+    if (!batch) {
+      return res.status(404).json({
+        success: false,
+        message: 'No batch found with this Portal ID'
+      });
+    }
+    
+    // Get transaction statistics
+    const transactions = await Transaction.aggregate([
+      { 
+        $match: { 
+          'metadata.portalId': portalId 
+        } 
+      },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          totalAmount: { $sum: '$amount' }
+        }
+      }
+    ]);
+    
+    const statistics = transactions.reduce((acc, stat) => {
+      acc[stat._id] = {
+        count: stat.count,
+        totalAmount: stat.totalAmount
+      };
+      return acc;
+    }, {});
+    
+    res.json({
+      success: true,
+      data: {
+        portalId,
+        batchId: batch.batchId,
+        exportedBy: batch.exportedBy?.fullName,
+        exportDate: batch.exportDate,
+        portalTracking: batch.portalTracking,
+        statistics,
+        totalOrders: batch.orders.length,
+        batchStatus: batch.status,
+        processingTime: batch.portalTracking.actualCompletionTime 
+          ? Math.round((new Date(batch.portalTracking.actualCompletionTime) - new Date(batch.portalTracking.enteredAt)) / 60000)
+          : null
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching portal status',
+      error: error.message
+    });
+  }
+});
+
+// 4. Search by Portal ID
+router.get('/portal/search', async (req, res) => {
+  try {
+    const { q, status, startDate, endDate, page = 1, limit = 20 } = req.query;
+    
+    const filter = {};
+    
+    if (q) {
+      filter['portalTracking.portalId'] = { $regex: q, $options: 'i' };
+    }
+    
+    if (status) {
+      filter['portalTracking.status'] = status;
+    }
+    
+    if (startDate || endDate) {
+      filter['portalTracking.enteredAt'] = {};
+      if (startDate) filter['portalTracking.enteredAt'].$gte = new Date(startDate);
+      if (endDate) filter['portalTracking.enteredAt'].$lte = new Date(endDate);
+    }
+    
+    const batches = await Batch.find(filter)
+      .select('batchId portalTracking exportDate stats')
+      .sort({ 'portalTracking.enteredAt': -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .populate('portalTracking.enteredBy', 'fullName')
+      .lean();
+    
+    const total = await Batch.countDocuments(filter);
+    
+    res.json({
+      success: true,
+      data: batches,
+      pagination: {
+        total,
+        page: parseInt(page),
+        pages: Math.ceil(total / limit)
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error searching portal IDs',
+      error: error.message
+    });
+  }
+});
+
+// 5. Get all active portal submissions
+router.get('/portal/active', async (req, res) => {
+  try {
+    const activeBatches = await Batch.find({
+      'portalTracking.status': { $in: ['submitted', 'processing'] }
+    })
+    .select('batchId portalTracking stats exportDate')
+    .sort({ 'portalTracking.enteredAt': -1 })
+    .populate('portalTracking.enteredBy', 'fullName');
+    
+    const summary = {
+      totalActive: activeBatches.length,
+      submitted: activeBatches.filter(b => b.portalTracking.status === 'submitted').length,
+      processing: activeBatches.filter(b => b.portalTracking.status === 'processing').length,
+      totalOrders: activeBatches.reduce((sum, b) => sum + b.stats.totalOrders, 0),
+      totalAmount: activeBatches.reduce((sum, b) => sum + b.stats.totalAmount, 0)
+    };
+    
+    res.json({
+      success: true,
+      data: {
+        summary,
+        batches: activeBatches
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching active portal submissions',
+      error: error.message
+    });
+  }
+});
+
+// 6. Bulk complete portal orders
+router.post('/portal/bulk-complete', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { portalIds, successRate = 100 } = req.body;
+    
+    if (!portalIds || !Array.isArray(portalIds) || portalIds.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({
+        success: false,
+        message: 'Portal IDs array is required'
+      });
+    }
+    
+    const results = {
+      completed: [],
+      failed: [],
+      notFound: []
+    };
+    
+    for (const portalId of portalIds) {
+      const batch = await Batch.findOne({
+        'portalTracking.portalId': portalId
+      });
+      
+      if (!batch) {
+        results.notFound.push(portalId);
+        continue;
+      }
+      
+      // Update batch
+      await Batch.findByIdAndUpdate(
+        batch._id,
+        {
+          $set: {
+            'portalTracking.status': 'completed',
+            'portalTracking.actualCompletionTime': new Date(),
+            'portalTracking.lastUpdated': new Date(),
+            'portalTracking.lastUpdatedBy': req.userId,
+            'status': 'completed'
+          },
+          $push: {
+            'portalTracking.updateHistory': {
+              status: 'completed',
+              notes: `Bulk completed with ${successRate}% success rate`,
+              updatedBy: req.userId,
+              updatedAt: new Date()
+            }
+          }
+        },
+        { session }
+      );
+      
+      // Update transactions
+      const orderIds = batch.orders.map(o => o.transactionId);
+      const transactions = await Transaction.find({
+        transactionId: { $in: orderIds }
+      }).session(session);
+      
+      let successCount = 0;
+      let failCount = 0;
+      
+      for (const transaction of transactions) {
+        const isSuccess = Math.random() * 100 < successRate;
+        
+        if (isSuccess) {
+          successCount++;
+          transaction.status = 'successful';
+          transaction.completedAt = new Date();
+          transaction.metadata.portalStatus = 'completed';
+          transaction.metadata.portalCompletedAt = new Date();
+        } else {
+          failCount++;
+          transaction.status = 'failed';
+          transaction.failureReason = 'Portal processing failed';
+          transaction.metadata.portalStatus = 'failed';
+          
+          // Process refund
+          const user = await User.findById(transaction.user).session(session);
+          if (user) {
+            user.wallet.balance += transaction.amount;
+            await user.save({ session });
+          }
+        }
+        
+        await transaction.save({ session });
+      }
+      
+      results.completed.push({
+        portalId,
+        batchId: batch.batchId,
+        totalOrders: transactions.length,
+        successful: successCount,
+        failed: failCount
+      });
+    }
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    res.json({
+      success: true,
+      message: 'Bulk portal completion processed',
+      results
+    });
+    
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    
+    res.status(500).json({
+      success: false,
+      message: 'Error in bulk portal completion',
+      error: error.message
+    });
+  }
+});
+
+// 7. Get Portal Statistics Dashboard
+router.get('/portal/statistics', async (req, res) => {
+  try {
+    const { days = 7 } = req.query;
+    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    
+    const statistics = await Batch.aggregate([
+      {
+        $match: {
+          'portalTracking.portalId': { $exists: true },
+          'portalTracking.enteredAt': { $gte: startDate }
+        }
+      },
+      {
+        $group: {
+          _id: '$portalTracking.status',
+          count: { $sum: 1 },
+          totalOrders: { $sum: '$stats.totalOrders' },
+          totalAmount: { $sum: '$stats.totalAmount' }
+        }
+      }
+    ]);
+    
+    const dailyStats = await Batch.aggregate([
+      {
+        $match: {
+          'portalTracking.portalId': { $exists: true },
+          'portalTracking.enteredAt': { $gte: startDate }
+        }
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: { 
+              format: '%Y-%m-%d', 
+              date: '$portalTracking.enteredAt' 
+            }
+          },
+          submissions: { $sum: 1 },
+          orders: { $sum: '$stats.totalOrders' },
+          amount: { $sum: '$stats.totalAmount' }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
+    
+    const averageProcessingTime = await Batch.aggregate([
+      {
+        $match: {
+          'portalTracking.status': 'completed',
+          'portalTracking.actualCompletionTime': { $exists: true }
+        }
+      },
+      {
+        $project: {
+          processingTime: {
+            $divide: [
+              { $subtract: ['$portalTracking.actualCompletionTime', '$portalTracking.enteredAt'] },
+              60000 // Convert to minutes
+            ]
+          }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          avgTime: { $avg: '$processingTime' },
+          minTime: { $min: '$processingTime' },
+          maxTime: { $max: '$processingTime' }
+        }
+      }
+    ]);
+    
+    res.json({
+      success: true,
+      data: {
+        statusBreakdown: statistics,
+        dailyStats,
+        processingTimes: averageProcessingTime[0] || {
+          avgTime: 0,
+          minTime: 0,
+          maxTime: 0
+        },
+        period: `Last ${days} days`
+      }
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching portal statistics',
+      error: error.message
+    });
+  }
+});
+
 // =============================================
 // CRON JOB FOR PERIODIC CHECKS
 // =============================================

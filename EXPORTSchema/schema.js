@@ -1,22 +1,43 @@
 // =============================================
-// EXPORT SETTINGS & TRACKING SCHEMA
-// Ghana MTN Data Reselling Platform
+// GHANA MTN DATA RESELLING PLATFORM - EXPORT SCHEMAS
+// EXPORT MANAGEMENT & SYSTEM STATUS SCHEMAS
+// File: EXPORTSchema/schema.js
 // =============================================
 
 const mongoose = require('mongoose');
 
 // =============================================
-// 1. EXPORT SETTINGS SCHEMA - SIMPLIFIED
+// IMPORT CORE MODELS FROM MAIN SCHEMA
+// =============================================
+
+// Import all core models from the main schema file
+// This prevents duplicate model definitions
+const {
+  User,
+  Product,
+  Transaction,
+  PriceSetting,
+  WalletTransaction,
+  SystemSetting,
+  ApiLog,
+  Notification,
+  Batch,
+  defaultSettings
+} = require('../schema/schema');
+
+// =============================================
+// EXPORT-SPECIFIC SCHEMAS
+// =============================================
+
+// =============================================
+// 1. EXPORT SETTINGS SCHEMA
 // =============================================
 
 const exportSettingsSchema = new mongoose.Schema({
-  // Settings Identification
   settingName: {
     type: String,
     required: true,
-    unique: true,
-    enum: ['default', 'peak_hours', 'off_peak', 'weekend', 'maintenance'],
-    default: 'default'
+    unique: true
   },
   
   isActive: {
@@ -24,79 +45,88 @@ const exportSettingsSchema = new mongoose.Schema({
     default: false
   },
   
-  // SIMPLIFIED Time Settings - Now focuses on single time value
+  // Export limits configuration
+  exportLimits: {
+    maxOrdersPerBatch: {
+      type: Number,
+      default: 40
+    },
+    maxBatchesPerDay: {
+      type: Number,
+      default: 100
+    },
+    cooldownMinutes: {
+      type: Number,
+      default: 5
+    }
+  },
+  
+  // Time settings for processing phases
   timeSettings: {
-    // Legacy phases (kept for compatibility but not used)
     phases: {
       initial: {
-        duration: { type: Number, default: 0 },
-        unit: { type: String, default: 'minutes' },
-        message: { type: String, default: '' }
+        duration: {
+          type: Number,
+          default: 5
+        },
+        unit: {
+          type: String,
+          default: 'minutes'
+        },
+        message: {
+          type: String,
+          default: 'Orders received and being prepared for processing...'
+        }
       },
       processing: {
-        duration: { type: Number, default: 0 },
-        unit: { type: String, default: 'minutes' },
-        message: { type: String, default: '' }
+        duration: {
+          type: Number,
+          default: 15
+        },
+        unit: {
+          type: String,
+          default: 'minutes'
+        },
+        message: {
+          type: String,
+          default: 'Orders are being processed by MTN system...'
+        }
       },
       finalizing: {
-        duration: { type: Number, default: 0 },
-        unit: { type: String, default: 'minutes' },
-        message: { type: String, default: '' }
+        duration: {
+          type: Number,
+          default: 10
+        },
+        unit: {
+          type: String,
+          default: 'minutes'
+        },
+        message: {
+          type: String,
+          default: 'Finalizing your orders. Almost complete...'
+        }
       }
     },
-    
-    // Total processing time - THIS IS NOW CALCULATED FROM fixedTimeMinutes
     totalProcessingMinutes: {
       type: Number,
       default: 30
     },
-    
-    // Buffer time for safety
     bufferMinutes: {
       type: Number,
-      default: 0
-    },
-    
-    // Working hours configuration
-    workingHours: {
-      enabled: {
-        type: Boolean,
-        default: false
-      },
-      startTime: {
-        type: String,
-        default: '08:00'
-      },
-      endTime: {
-        type: String,
-        default: '20:00'
-      },
-      timezone: {
-        type: String,
-        default: 'Africa/Accra'
-      },
-      outsideHoursMessage: {
-        type: String,
-        default: 'Orders placed outside working hours will be processed when service resumes.'
-      }
+      default: 5
     }
   },
   
-  // System Messages
+  // User-facing messages
   messages: {
-    // Pre-export messages
     beforeExport: {
       type: String,
       default: 'Preparing to export orders to processing system...'
     },
-    
-    // Export confirmation
     exportSuccess: {
       type: String,
       default: 'Your orders have been successfully sent to MTN for processing.'
     },
-    
-    // Processing stages
     stages: {
       queued: {
         title: {
@@ -112,7 +142,6 @@ const exportSettingsSchema = new mongoose.Schema({
           default: 'clock'
         }
       },
-      
       sent: {
         title: {
           type: String,
@@ -127,7 +156,6 @@ const exportSettingsSchema = new mongoose.Schema({
           default: 'send'
         }
       },
-      
       processing: {
         title: {
           type: String,
@@ -135,14 +163,13 @@ const exportSettingsSchema = new mongoose.Schema({
         },
         description: {
           type: String,
-          default: 'Your orders are being processed.'
+          default: 'Your orders are being processed. This usually takes 15-30 minutes.'
         },
         icon: {
           type: String,
           default: 'loader'
         }
       },
-      
       completed: {
         title: {
           type: String,
@@ -157,7 +184,6 @@ const exportSettingsSchema = new mongoose.Schema({
           default: 'check-circle'
         }
       },
-      
       failed: {
         title: {
           type: String,
@@ -172,110 +198,121 @@ const exportSettingsSchema = new mongoose.Schema({
           default: 'alert-circle'
         }
       }
-    },
-    
-    // Error messages
-    errors: {
-      exportFailed: {
-        type: String,
-        default: 'Failed to export orders. Please try again.'
-      },
-      connectionLost: {
-        type: String,
-        default: 'Connection to processing system lost. Retrying...'
-      },
-      timeout: {
-        type: String,
-        default: 'Processing is taking longer than expected. Please be patient.'
-      }
     }
   },
   
-  // SIMPLIFIED Auto-completion settings
+  // Auto-completion configuration
   autoComplete: {
     enabled: {
       type: Boolean,
       default: true
     },
-    
     strategy: {
       type: String,
-      enum: ['fixed_time', 'percentage_based', 'api_check', 'manual'],
+      enum: ['fixed_time', 'progressive', 'manual'],
       default: 'fixed_time'
     },
-    
-    // PRIMARY TIME CONTROL - This is the main setting now
     fixedTimeMinutes: {
       type: Number,
-      default: 30,
-      min: 1,      // Minimum 1 minute
-      max: 1440    // Maximum 24 hours (1440 minutes)
+      default: 30
     },
-    
-    // Success rate configuration
+    progressiveIntervals: [{
+      afterMinutes: Number,
+      completePercentage: Number
+    }],
     successRate: {
       type: Number,
       default: 95,
       min: 0,
       max: 100
+    }
+  },
+  
+  // Excel file format configuration
+  fileFormat: {
+    includeHeaders: {
+      type: Boolean,
+      default: true
     },
-    
-    // Retry settings for failed orders
-    retrySettings: {
-      enabled: {
+    columns: [{
+      field: String,
+      header: String,
+      format: String
+    }],
+    dateFormat: {
+      type: String,
+      default: 'YYYY-MM-DD HH:mm:ss'
+    },
+    numberFormat: {
+      extractNumericOnly: {
         type: Boolean,
-        default: false
-      },
-      maxAttempts: {
-        type: Number,
-        default: 3
-      },
-      delayMinutes: {
-        type: Number,
-        default: 5
+        default: true
       }
     }
   },
   
-  // FIXED: Made createdBy optional for system-created settings
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'reseller_users',
-    required: false  // Changed from true to false
+  // Portal integration settings
+  portalIntegration: {
+    enabled: {
+      type: Boolean,
+      default: true
+    },
+    autoSubmitToPortal: {
+      type: Boolean,
+      default: false
+    },
+    portalUrl: String,
+    apiEndpoint: String,
+    requiresManualPortalId: {
+      type: Boolean,
+      default: true
+    }
   },
   
-  lastModifiedBy: {
+  // Notification settings
+  notifications: {
+    notifyOnExport: {
+      type: Boolean,
+      default: true
+    },
+    notifyOnCompletion: {
+      type: Boolean,
+      default: true
+    },
+    notifyOnFailure: {
+      type: Boolean,
+      default: true
+    },
+    adminAlerts: {
+      enabled: {
+        type: Boolean,
+        default: true
+      },
+      alertEmails: [String],
+      alertThreshold: {
+        failurePercentage: {
+          type: Number,
+          default: 10
+        },
+        minimumOrders: {
+          type: Number,
+          default: 5
+        }
+      }
+    }
+  },
+  
+  // Admin tracking
+  createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'reseller_users'
   },
-  
-  // Activation schedule (optional)
-  schedule: {
-    activateAt: Date,
-    deactivateAt: Date,
-    recurring: {
-      enabled: {
-        type: Boolean,
-        default: false
-      },
-      pattern: {
-        type: String,
-        enum: ['daily', 'weekly', 'custom']
-      },
-      customCron: String
-    }
+  lastModifiedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
   }
 }, {
   timestamps: true
-});
-
-// SIMPLIFIED: Calculate total processing time from fixedTimeMinutes
-exportSettingsSchema.pre('save', function(next) {
-  // Use fixedTimeMinutes as the primary time source
-  if (this.autoComplete && this.autoComplete.fixedTimeMinutes) {
-    this.timeSettings.totalProcessingMinutes = this.autoComplete.fixedTimeMinutes;
-  }
-  next();
 });
 
 // =============================================
@@ -283,7 +320,6 @@ exportSettingsSchema.pre('save', function(next) {
 // =============================================
 
 const exportHistorySchema = new mongoose.Schema({
-  // Export identification
   exportId: {
     type: String,
     required: true,
@@ -301,62 +337,88 @@ const exportHistorySchema = new mongoose.Schema({
       type: Number,
       required: true
     },
-    
-    totalAmount: {
-      type: Number,
-      required: true
-    },
-    
+    totalAmount: Number,
     orderIds: [{
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Transaction_reseller'
     }],
-    
     exportMethod: {
       type: String,
-      enum: ['manual', 'automatic', 'scheduled', 'api'],
+      enum: ['manual', 'automatic', 'scheduled'],
       default: 'manual'
     },
-    
     triggerSource: {
       type: String,
       enum: ['admin_dashboard', 'api', 'scheduler', 'system'],
       default: 'admin_dashboard'
+    },
+    // Batch pagination metadata
+    metadata: {
+      batchPage: Number,
+      totalBatches: Number,
+      ordersPerBatch: Number,
+      totalAvailableOrders: Number,
+      remainingOrders: Number,
+      isReExport: Boolean,
+      originalBatchId: String,
+      limitedTo40: {
+        type: Boolean,
+        default: true
+      },
+      excludedOrders: Number
     }
   },
   
-  // SIMPLIFIED Timing information
+  // Timestamps for tracking
   timestamps: {
     exportedAt: {
       type: Date,
-      required: true,
       default: Date.now
     },
-    
-    startedProcessingAt: Date,
+    estimatedCompletionTime: Date,
     completedAt: Date,
-    
-    // Simplified phase tracking
     phases: {
+      initial: {
+        startedAt: Date,
+        completedAt: Date
+      },
       processing: {
         startedAt: Date,
-        estimatedDuration: Number  // In minutes
+        completedAt: Date,
+        estimatedDuration: Number
+      },
+      finalizing: {
+        startedAt: Date,
+        completedAt: Date
       }
-    },
-    
-    // Actual vs estimated
-    estimatedCompletionTime: Date,
-    actualProcessingMinutes: Number
+    }
   },
   
   // Status tracking
   status: {
     current: {
       type: String,
-      enum: ['pending', 'exporting', 'exported', 'processing', 'completed', 'failed', 'partial','re-export'],
-      default: 'pending'
+      enum: ['exporting', 'exported', 'processing', 'completed', 'failed', 're-export'],
+      default: 'exporting'
     },
-    
+    progressPercentage: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 100
+    },
+    successCount: {
+      type: Number,
+      default: 0
+    },
+    failedCount: {
+      type: Number,
+      default: 0
+    },
+    pendingCount: {
+      type: Number,
+      default: 0
+    },
     history: [{
       status: String,
       timestamp: Date,
@@ -365,106 +427,105 @@ const exportHistorySchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'reseller_users'
       }
-    }],
-    
-    // Success metrics
-    successCount: {
-      type: Number,
-      default: 0
-    },
-    
-    failedCount: {
-      type: Number,
-      default: 0
-    },
-    
-    pendingCount: {
-      type: Number,
-      default: 0
-    },
-    
-    successRate: Number
+    }]
   },
   
-  // SIMPLIFIED Settings used for this export
+  // Settings snapshot at time of export
   settingsUsed: {
     settingName: String,
-    totalProcessingMinutes: Number,    // Single time value
+    totalProcessingMinutes: Number,
     autoCompleteEnabled: Boolean,
-    successRate: Number,               // Success rate percentage
-    messages: Object
+    successRate: Number,
+    messages: mongoose.Schema.Types.Mixed
   },
   
-  // External system info
-  externalSystem: {
-    name: {
-      type: String,
-      default: 'MTN Gateway'
-    },
-    referenceId: String,
-    responseCode: String,
-    responseMessage: String,
-    rawResponse: mongoose.Schema.Types.Mixed
-  },
-  
-  // User who initiated export
+  // Who exported
   exportedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'reseller_users',
     required: true
   },
   
-  // Files generated
-  files: [{
-    type: {
-      type: String,
-      enum: ['csv', 'excel', 'json', 'pdf']
-    },
-    filename: String,
-    url: String,
-    size: Number,
-    generatedAt: Date
-  }],
+  // File details
+  fileDetails: {
+    fileName: String,
+    fileSize: Number,
+    fileUrl: String,
+    downloadCount: {
+      type: Number,
+      default: 0
+    }
+  },
   
-  // Notes and comments
-  notes: [{
-    text: String,
-    addedBy: {
+  // Portal link if submitted
+  portalSubmission: {
+    portalId: String,
+    submittedAt: Date,
+    submittedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'reseller_users'
-    },
-    addedAt: {
-      type: Date,
-      default: Date.now
     }
-  }],
-  
-  // Error tracking
-  errors: [{
-    timestamp: Date,
-    type: String,
-    message: String,
-    details: mongoose.Schema.Types.Mixed
-  }]
+  }
 }, {
   timestamps: true
 });
 
-// Indexes for efficient queries
-exportHistorySchema.index({ exportedAt: -1 });
+// Indexes
+exportHistorySchema.index({ exportId: 1 });
 exportHistorySchema.index({ 'status.current': 1 });
-exportHistorySchema.index({ exportedBy: 1 });
 exportHistorySchema.index({ 'timestamps.exportedAt': -1 });
+exportHistorySchema.index({ exportedBy: 1 });
 
 // =============================================
 // 3. SYSTEM STATUS SCHEMA
 // =============================================
 
 const systemStatusSchema = new mongoose.Schema({
-  // Single document for current system status
   _id: {
     type: String,
     default: 'current_status'
+  },
+  
+  // System health monitoring
+  systemHealth: {
+    status: {
+      type: String,
+      enum: ['healthy', 'degraded', 'critical'],
+      default: 'healthy'
+    },
+    lastCheckedAt: Date,
+    issues: [String],
+    metrics: {
+      cpuUsage: Number,
+      memoryUsage: Number,
+      diskSpace: Number,
+      activeConnections: Number
+    }
+  },
+  
+  // Current processing state
+  currentProcessing: {
+    isProcessing: {
+      type: Boolean,
+      default: false
+    },
+    activeExports: [{
+      exportId: String,
+      startedAt: Date,
+      estimatedCompletion: Date,
+      processingMinutes: Number,
+      progress: Number,
+      orderCount: Number,
+      batchInfo: String
+    }],
+    queuedExports: {
+      type: Number,
+      default: 0
+    },
+    processingCapacity: {
+      current: Number,
+      maximum: Number
+    }
   },
   
   // Last export information
@@ -473,92 +534,81 @@ const systemStatusSchema = new mongoose.Schema({
     exportedAt: Date,
     totalOrders: Number,
     status: String,
-    processingMinutes: Number,  // Added single time value
     exportedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'reseller_users'
     },
-    completedAt: Date
-  },
-  
-  // Current processing
-  currentProcessing: {
-    isProcessing: {
-      type: Boolean,
-      default: false
-    },
-    
-    activeExports: [{
-      exportId: String,
-      startedAt: Date,
-      estimatedCompletion: Date,
-      processingMinutes: Number,  // Added single time value
-      progress: Number,
-      orderCount: Number
-    }],
-    
-    queuedExports: Number,
-    
-    processingSpeed: {
-      ordersPerMinute: Number,
-      averageProcessingTime: Number
+    processingMinutes: Number,
+    completedAt: Date,
+    successCount: Number,
+    failedCount: Number,
+    batchInfo: {
+      currentBatch: Number,
+      totalBatches: Number,
+      totalAvailable: Number,
+      remainingOrders: Number
     }
   },
   
-  // System health
-  systemHealth: {
-    status: {
-      type: String,
-      enum: ['healthy', 'degraded', 'down', 'maintenance'],
-      default: 'healthy'
-    },
-    
-    lastCheckedAt: Date,
-    
-    thirdPartyStatus: {
-      available: Boolean,
-      lastSuccessfulConnection: Date,
-      responseTime: Number,
-      errorRate: Number
-    },
-    
-    exportServiceStatus: {
-      available: Boolean,
-      queueLength: Number,
-      processingRate: Number
-    }
-  },
+  lastExportDisplay: String,
   
   // Statistics
   statistics: {
     today: {
-      totalExports: Number,
-      totalOrders: Number,
-      successRate: Number,
+      totalExports: {
+        type: Number,
+        default: 0
+      },
+      totalOrders: {
+        type: Number,
+        default: 0
+      },
+      successRate: {
+        type: Number,
+        default: 100
+      },
       averageProcessingTime: Number,
       lastUpdated: Date
     },
-    
     thisWeek: {
-      totalExports: Number,
-      totalOrders: Number,
-      successRate: Number,
-      averageProcessingTime: Number
+      totalExports: {
+        type: Number,
+        default: 0
+      },
+      totalOrders: {
+        type: Number,
+        default: 0
+      },
+      avgProcessingTime: Number
     },
-    
     thisMonth: {
-      totalExports: Number,
-      totalOrders: Number,
-      successRate: Number,
-      averageProcessingTime: Number
+      totalExports: {
+        type: Number,
+        default: 0
+      },
+      totalOrders: {
+        type: Number,
+        default: 0
+      },
+      totalAmount: {
+        type: Number,
+        default: 0
+      }
+    },
+    allTime: {
+      totalExports: {
+        type: Number,
+        default: 0
+      },
+      totalOrders: {
+        type: Number,
+        default: 0
+      },
+      totalAmount: {
+        type: Number,
+        default: 0
+      }
     }
-  },
-  
-  // Active settings
-  activeSettings: {
-    settingName: String,
-    activeSince: Date,
-    nextScheduledChange: Date
   },
   
   // Maintenance mode
@@ -570,25 +620,25 @@ const systemStatusSchema = new mongoose.Schema({
     message: String,
     startedAt: Date,
     estimatedEndTime: Date,
-    allowExports: {
-      type: Boolean,
-      default: false
-    }
+    allowedRoles: [String]
   },
   
-  // Display message for users
-  userMessage: {
-    enabled: {
-      type: Boolean,
-      default: false
+  // User message for dashboard
+  userMessage: String,
+  adminMessage: String,
+  
+  // Portal statistics
+  portalStatistics: {
+    totalSubmissions: {
+      type: Number,
+      default: 0
     },
-    message: String,
-    type: {
-      type: String,
-      enum: ['info', 'warning', 'success', 'error'],
-      default: 'info'
+    pendingSubmissions: {
+      type: Number,
+      default: 0
     },
-    showUntil: Date
+    averageCompletionTime: Number,
+    lastSubmissionAt: Date
   }
 }, {
   timestamps: true
@@ -599,77 +649,137 @@ const systemStatusSchema = new mongoose.Schema({
 // =============================================
 
 const exportQueueSchema = new mongoose.Schema({
-  // Queue management
-  priority: {
-    type: Number,
-    default: 0,
-    min: 0,
-    max: 10
-  },
-  
-  scheduledFor: {
-    type: Date,
-    required: true
-  },
-  
-  // Orders to export
-  orders: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Transaction_reseller'
-  }],
-  
-  // Queue status
-  status: {
+  queueId: {
     type: String,
-    enum: ['waiting', 'processing', 'completed', 'failed', 'cancelled'],
-    default: 'waiting'
+    required: true,
+    unique: true
   },
   
-  attempts: {
+  // Queue priority
+  priority: {
     type: Number,
     default: 0
   },
   
+  // Export configuration
+  exportConfig: {
+    filterCriteria: {
+      status: String,
+      dateFrom: Date,
+      dateTo: Date,
+      userRole: String,
+      userId: mongoose.Schema.Types.ObjectId
+    },
+    expectedOrders: Number,
+    orderIds: [String],
+    maxOrders: {
+      type: Number,
+      default: 40
+    }
+  },
+  
+  // Queue status
+  status: {
+    type: String,
+    enum: ['queued', 'processing', 'completed', 'failed', 'cancelled'],
+    default: 'queued'
+  },
+  
+  // Scheduling
+  scheduledFor: Date,
+  recurringSchedule: {
+    enabled: {
+      type: Boolean,
+      default: false
+    },
+    pattern: {
+      type: String,
+      enum: ['daily', 'weekly', 'monthly']
+    },
+    time: String, // e.g., "14:30"
+    daysOfWeek: [Number], // 0-6, Sunday to Saturday
+    dayOfMonth: Number // 1-31
+  },
+  
+  // Retry configuration
+  attempts: {
+    type: Number,
+    default: 0
+  },
   maxAttempts: {
     type: Number,
     default: 3
   },
+  lastAttemptAt: Date,
+  nextRetryAt: Date,
   
-  // Processing details
-  processingStartedAt: Date,
-  processingCompletedAt: Date,
+  // Error tracking
+  errors: [{
+    message: String,
+    timestamp: Date,
+    stack: String
+  }],
+  lastError: String,
   
-  // Created by
+  // Results
+  results: {
+    exportId: String,
+    processedOrders: Number,
+    successCount: Number,
+    failedCount: Number,
+    fileUrl: String
+  },
+  
+  // Metadata
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'reseller_users'
   },
-  
-  // Error handling
-  lastError: {
-    message: String,
-    occurredAt: Date
-  },
-  
-  // Settings to use
-  settingsToUse: {
-    type: String,
-    default: 'default'
+  processedAt: Date,
+  completedAt: Date,
+  cancelledAt: Date,
+  cancelledBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
   }
 }, {
   timestamps: true
 });
 
-exportQueueSchema.index({ status: 1, scheduledFor: 1 });
-exportQueueSchema.index({ priority: -1 });
+// Indexes
+exportQueueSchema.index({ status: 1, priority: -1 });
+exportQueueSchema.index({ scheduledFor: 1 });
+exportQueueSchema.index({ createdBy: 1 });
 
 // =============================================
-// EXPORT MODELS
+// SAFE MODEL CREATION - PREVENTS OVERWRITE ERROR
+// =============================================
+
+const ExportSettings = mongoose.models['ExportSettings'] || mongoose.model('ExportSettings', exportSettingsSchema);
+const ExportHistory = mongoose.models['ExportHistory'] || mongoose.model('ExportHistory', exportHistorySchema);
+const SystemStatus = mongoose.models['SystemStatus'] || mongoose.model('SystemStatus', systemStatusSchema);
+const ExportQueue = mongoose.models['ExportQueue'] || mongoose.model('ExportQueue', exportQueueSchema);
+
+// =============================================
+// EXPORT ALL MODELS
 // =============================================
 
 module.exports = {
-  ExportSettings: mongoose.model('ExportSettings', exportSettingsSchema),
-  ExportHistory: mongoose.model('ExportHistory', exportHistorySchema),
-  SystemStatus: mongoose.model('SystemStatus', systemStatusSchema),
-  ExportQueue: mongoose.model('ExportQueue', exportQueueSchema)
+  // Re-export core models from main schema
+  User,
+  Product,
+  Transaction,
+  PriceSetting,
+  WalletTransaction,
+  SystemSetting,
+  ApiLog,
+  Notification,
+  Batch,
+  defaultSettings,
+  
+  // Export-specific models
+  ExportSettings,
+  ExportHistory,
+  SystemStatus,
+  ExportQueue
 };

@@ -1,6 +1,7 @@
 // =============================================
-// GHANA MTN DATA RESELLING PLATFORM - SIMPLIFIED MONGODB SCHEMAS
-// Node.js with Mongoose
+// GHANA MTN DATA RESELLING PLATFORM - MAIN SCHEMA
+// WITH PORTAL ID TRACKING INTEGRATION
+// File: schema/schema.js
 // =============================================
 
 const mongoose = require('mongoose');
@@ -76,7 +77,19 @@ const userSchema = new mongoose.Schema({
     },
     apiKey: String,
     apiSecret: String,
-    webhookUrl: String
+    webhookUrl: String,
+    rateLimit: {
+      type: Number,
+      default: 100
+    },
+    requestCount: {
+      type: Number,
+      default: 0
+    },
+    lastUsed: Date,
+    createdAt: Date,
+    regeneratedAt: Date,
+    revokedAt: Date
   },
   
   // Timestamps
@@ -84,7 +97,8 @@ const userSchema = new mongoose.Schema({
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'reseller_users'
-  }
+  },
+  deletedAt: Date
 }, {
   timestamps: true
 });
@@ -166,6 +180,12 @@ const productSchema = new mongoose.Schema({
     default: 'active'
   },
   
+  // Pricing (populated from PriceSetting)
+  pricing: [{
+    role: String,
+    price: Number
+  }],
+  
   // Statistics
   stats: {
     totalSold: {
@@ -183,6 +203,10 @@ const productSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'reseller_users',
     required: true
+  },
+  lastModifiedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
   }
 }, {
   timestamps: true
@@ -193,12 +217,11 @@ productSchema.index({ status: 1 });
 productSchema.index({ category: 1 });
 
 // =============================================
-// 3. TRANSACTION SCHEMA
+// 3. TRANSACTION SCHEMA - WITH PORTAL TRACKING
 // =============================================
 
-// Updated Transaction Schema with proper metadata structure
 const transactionSchema = new mongoose.Schema({
-  // Transaction ID
+  // Transaction ID (6-digit reference)
   transactionId: {
     type: String,
     required: true,
@@ -266,21 +289,53 @@ const transactionSchema = new mongoose.Schema({
     default: 'wallet'
   },
   
-  // Reference
+  // Reference (6-digit)
   reference: {
     type: String,
     unique: true,
     sparse: true
   },
   
-  // FIXED: Properly structured metadata for export tracking
+  // ENHANCED METADATA WITH PORTAL TRACKING
   metadata: {
-    exportId: String,
-    batchId: String,
+    // Export tracking
+    exportId: {
+      type: String,
+      index: true
+    },
+    batchId: {
+      type: String,
+      index: true
+    },
+    batchPage: Number,
     bulkReference: String,
+    
+    // Portal tracking
+    portalId: {
+      type: String,
+      index: true
+    },
+    portalSubmittedAt: Date,
+    portalCompletedAt: Date,
+    portalStatus: {
+      type: String,
+      enum: ['pending', 'submitted', 'processing', 'completed', 'failed']
+    },
+    
+    // Processing info
     estimatedCompletion: Date,
     processingMinutes: Number,
-    note: String
+    
+    // Export readiness
+    exportReady: {
+      type: Boolean,
+      default: true
+    },
+    exportedInBatch: Number,
+    
+    // Additional tracking
+    note: String,
+    isReExport: Boolean
   },
   
   // Export tracking fields
@@ -320,26 +375,32 @@ transactionSchema.index({ user: 1, createdAt: -1 });
 transactionSchema.index({ status: 1 });
 transactionSchema.index({ type: 1 });
 transactionSchema.index({ 'dataDetails.beneficiaryNumber': 1 });
-transactionSchema.index({ 'metadata.exportId': 1 }); // Important for export queries
+transactionSchema.index({ 'metadata.exportId': 1 });
 transactionSchema.index({ 'metadata.batchId': 1 });
-transactionSchema.index({ status: 1, 'metadata.exportId': 1 }); // Compound index for auto-completion
+transactionSchema.index({ 'metadata.portalId': 1 });
+transactionSchema.index({ status: 1, 'metadata.exportId': 1 });
+transactionSchema.index({ 'metadata.exportReady': 1, status: 1 });
 
 // Auto-generate transaction ID
 transactionSchema.pre('save', function(next) {
   if (!this.transactionId) {
-    this.transactionId = 'TXN' + Date.now() + Math.random().toString(36).substr(2, 9).toUpperCase();
+    // Generate 6-digit ID
+    this.transactionId = Math.floor(100000 + Math.random() * 900000).toString();
+  }
+  if (!this.reference) {
+    this.reference = this.transactionId;
   }
   next();
 });
 
 // =============================================
-// 4. PRICE SETTING SCHEMA (Admin sets prices)
+// 4. PRICE SETTING SCHEMA
 // =============================================
 
 const priceSettingSchema = new mongoose.Schema({
   product: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Product_reseller',  // Fixed reference
+    ref: 'Product_reseller',
     required: true
   },
   
@@ -421,7 +482,7 @@ const walletTransactionSchema = new mongoose.Schema({
   
   purpose: {
     type: String,
-    enum: ['funding', 'purchase', 'refund', 'withdrawal', 'commission', 'adjustment','reprocess_charge'],
+    enum: ['funding', 'purchase', 'refund', 'withdrawal', 'commission', 'adjustment', 'reprocess_charge', 'bulk_reprocess'],
     required: true
   },
   
@@ -442,7 +503,20 @@ const walletTransactionSchema = new mongoose.Schema({
   // Related transaction if any
   relatedTransaction: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Transaction_reseller'  // Fixed reference
+    ref: 'Transaction_reseller'
+  },
+  
+  // Metadata for bulk operations
+  metadata: {
+    transactionIds: [String],
+    count: Number,
+    bulkReference: String
+  },
+  
+  // Admin tracking
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
   }
 }, {
   timestamps: true
@@ -466,8 +540,12 @@ const systemSettingSchema = new mongoose.Schema({
   description: String,
   category: {
     type: String,
-    enum: ['general', 'maintenance', 'api', 'payment'],
+    enum: ['general', 'maintenance', 'api', 'payment', 'export'],
     required: true
+  },
+  lastModifiedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'reseller_users'
   }
 }, {
   timestamps: true
@@ -510,11 +588,17 @@ const defaultSettings = [
     value: '',
     category: 'api',
     description: 'MTN API key'
+  },
+  {
+    key: 'max_orders_per_export',
+    value: 40,
+    category: 'export',
+    description: 'Maximum orders per export batch'
   }
 ];
 
 // =============================================
-// 7. API REQUEST LOG SCHEMA (For tracking API usage)
+// 7. API REQUEST LOG SCHEMA
 // =============================================
 
 const apiLogSchema = new mongoose.Schema({
@@ -581,7 +665,7 @@ const notificationSchema = new mongoose.Schema({
   
   category: {
     type: String,
-    enum: ['transaction', 'wallet', 'system', 'promotion'],
+    enum: ['transaction', 'wallet', 'system', 'promotion', 'export', 'portal'],
     default: 'system'
   },
   
@@ -594,7 +678,12 @@ const notificationSchema = new mongoose.Schema({
   
   relatedTransaction: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Transaction_reseller'  // Fixed reference
+    ref: 'Transaction_reseller'
+  },
+  
+  relatedBatch: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Batch_reseller'
   },
   
   metadata: Object
@@ -605,8 +694,9 @@ const notificationSchema = new mongoose.Schema({
 notificationSchema.index({ user: 1, read: 1 });
 notificationSchema.index({ createdAt: -1 });
 
-
-// Add this to your schema.js file
+// =============================================
+// 9. BATCH SCHEMA - WITH PORTAL TRACKING
+// =============================================
 
 const batchSchema = new mongoose.Schema({
   batchId: {
@@ -630,6 +720,13 @@ const batchSchema = new mongoose.Schema({
   exportDate: {
     type: Date,
     default: Date.now
+  },
+  
+  // Processing status
+  processingStatus: {
+    type: String,
+    enum: ['exported', 'sent_to_third_party', 're-exported'],
+    default: 'exported'
   },
   
   // Orders in this batch
@@ -674,6 +771,55 @@ const batchSchema = new mongoose.Schema({
     }
   },
   
+  // PORTAL TRACKING
+  portalTracking: {
+    portalId: {
+      type: String,
+      index: true,
+      unique: true,
+      sparse: true // Allows null but ensures uniqueness when set
+    },
+    enteredBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'reseller_users'
+    },
+    enteredAt: Date,
+    estimatedCompletionTime: Date,
+    actualCompletionTime: Date,
+    status: {
+      type: String,
+      enum: ['pending', 'submitted', 'processing', 'completed', 'failed'],
+      default: 'pending'
+    },
+    notes: String,
+    lastUpdated: Date,
+    lastUpdatedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'reseller_users'
+    },
+    updateHistory: [{
+      status: String,
+      notes: String,
+      updatedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'reseller_users'
+      },
+      updatedAt: Date
+    }]
+  },
+  
+  // Metadata for batch details
+  metadata: {
+    batchPage: Number,
+    totalBatches: Number,
+    ordersPerBatch: Number,
+    isPartialBatch: Boolean,
+    hasMoreBatches: Boolean,
+    isReExport: Boolean,
+    originalBatchId: String,
+    limitApplied: Boolean
+  },
+  
   // File details
   fileName: String,
   fileUrl: String,
@@ -690,27 +836,40 @@ const batchSchema = new mongoose.Schema({
   timestamps: true
 });
 
+// Indexes
 batchSchema.index({ batchId: 1 });
 batchSchema.index({ exportedBy: 1 });
 batchSchema.index({ exportDate: -1 });
+batchSchema.index({ 'portalTracking.portalId': 1 });
+batchSchema.index({ 'portalTracking.status': 1 });
 
-// Export it
-// module.exports.Batch = mongoose.model('Batch_reseller', batchSchema);
+// =============================================
+// SAFE MODEL CREATION - PREVENTS OVERWRITE ERROR
+// =============================================
+
+const User = mongoose.models['reseller_users'] || mongoose.model('reseller_users', userSchema);
+const Product = mongoose.models['Product_reseller'] || mongoose.model('Product_reseller', productSchema);
+const Transaction = mongoose.models['Transaction_reseller'] || mongoose.model('Transaction_reseller', transactionSchema);
+const PriceSetting = mongoose.models['PriceSetting_reseller'] || mongoose.model('PriceSetting_reseller', priceSettingSchema);
+const WalletTransaction = mongoose.models['WalletTransaction_reseller'] || mongoose.model('WalletTransaction_reseller', walletTransactionSchema);
+const SystemSetting = mongoose.models['SystemSetting'] || mongoose.model('SystemSetting', systemSettingSchema);
+const ApiLog = mongoose.models['ApiLog'] || mongoose.model('ApiLog', apiLogSchema);
+const Notification = mongoose.models['Notification'] || mongoose.model('Notification', notificationSchema);
+const Batch = mongoose.models['Batch_reseller'] || mongoose.model('Batch_reseller', batchSchema);
 
 // =============================================
 // EXPORT MODELS
 // =============================================
 
 module.exports = {
-  User: mongoose.model('reseller_users', userSchema),
-  Product: mongoose.model('Product_reseller', productSchema),
-  Transaction: mongoose.model('Transaction_reseller', transactionSchema),
-  PriceSetting: mongoose.model('PriceSetting_reseller', priceSettingSchema),
-  WalletTransaction: mongoose.model('WalletTransaction_reseller', walletTransactionSchema),
-  SystemSetting: mongoose.model('SystemSetting', systemSettingSchema),
-  ApiLog: mongoose.model('ApiLog', apiLogSchema),
-  Notification: mongoose.model('Notification', notificationSchema),
-  Batch: mongoose.model('Batch_reseller', batchSchema),
-
+  User,
+  Product,
+  Transaction,
+  PriceSetting,
+  WalletTransaction,
+  SystemSetting,
+  ApiLog,
+  Notification,
+  Batch,
   defaultSettings
 };
