@@ -2500,7 +2500,7 @@ router.post('/orders/export/preview', async (req, res) => {
     
     // Get total count
     const totalCount = await Transaction.countDocuments(filter);
-    const ordersPerBatch = 40;
+    const ordersPerBatch = 90;
     const totalBatches = Math.ceil(totalCount / ordersPerBatch);
     
     // Fetch only 40 orders for preview
@@ -2578,7 +2578,7 @@ router.post('/orders/export/excel', async (req, res) => {
     } = req.body;
     
     // Fixed limit of 40 orders per export
-    const ORDERS_PER_BATCH = 40;
+    const ORDERS_PER_BATCH = 90;
     
     // Get active export settings
     let exportSettings = await ExportSettings.findOne({ isActive: true });
