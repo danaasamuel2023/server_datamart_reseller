@@ -1,6 +1,6 @@
 // =============================================
 // EXTERNAL API ROUTES - GHANA MTN DATA PLATFORM
-// COMPLETE - Fixed bulk orders + webhook status updates
+// COMPLETE - Fixed bulk orders + webhook status updates + OPTIONAL SIGNATURE
 // =============================================
 
 const express = require('express');
@@ -94,7 +94,7 @@ const apiResponse = {
 };
 
 // =============================================
-// WEBHOOK HELPER - WITH STATUS UPDATES
+// WEBHOOK HELPER - WITH OPTIONAL SIGNATURE
 // =============================================
 
 const sendWebhook = async (user, event, data) => {
@@ -104,25 +104,32 @@ const sendWebhook = async (user, event, data) => {
     const payload = {
       event,
       data,
-      timestamp: new Date().toISOString(),
-      signature: crypto
-        .createHmac('sha256', user.apiAccess.apiSecret)
-        .update(JSON.stringify(data))
-        .digest('hex')
+      timestamp: new Date().toISOString()
     };
     
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-Platform-Event': event
+    };
+    
+    // Only add signature if apiSecret exists (OPTIONAL)
+    if (user.apiAccess.apiSecret) {
+      payload.signature = crypto
+        .createHmac('sha256', user.apiAccess.apiSecret)
+        .update(JSON.stringify(data))
+        .digest('hex');
+      
+      headers['X-Platform-Signature'] = payload.signature;
+    }
+    
     await axios.post(user.apiAccess.webhookUrl, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Platform-Event': event,
-        'X-Platform-Signature': payload.signature
-      },
+      headers,
       timeout: 5000
     });
     
-    console.log(`Webhook sent: ${event} to ${user.apiAccess.webhookUrl}`);
+    console.log(`✅ Webhook sent: ${event} to ${user.apiAccess.webhookUrl}`);
   } catch (error) {
-    console.error('Webhook error:', error.message);
+    console.error('❌ Webhook error:', error.message);
   }
 };
 
@@ -240,7 +247,8 @@ router.get('/v1/account', async (req, res) => {
       api: {
         requestCount: user.apiAccess.requestCount,
         rateLimit: user.apiAccess.rateLimit || 100,
-        webhookUrl: user.apiAccess.webhookUrl
+        webhookUrl: user.apiAccess.webhookUrl,
+        webhookSignatureEnabled: !!user.apiAccess.apiSecret
       }
     });
   } catch (error) {
@@ -514,7 +522,7 @@ router.post('/v1/purchase', async (req, res) => {
     
     await session.commitTransaction();
     
-    // Send webhook with transaction status
+    // Send webhook with transaction status (signature optional)
     sendWebhook(user, 'transaction.created', {
       reference: transactionRef,
       transaction_id: transaction._id,
@@ -799,7 +807,7 @@ router.post('/v1/purchase/bulk', async (req, res) => {
     if (processedOrders.length > 0) {
       await session.commitTransaction();
       
-      // Send webhook with detailed status
+      // Send webhook with detailed status (signature optional)
       sendWebhook(user, 'bulk_purchase.completed', {
         bulk_reference: bulkReference,
         status: 'completed',
@@ -1004,24 +1012,47 @@ router.put('/v1/webhook', async (req, res) => {
     });
     
     try {
-      await axios.post(webhook_url, {
+      const user = await User.findById(req.userId).select('apiAccess');
+      
+      const testPayload = {
         event: 'webhook.test',
         data: {
           message: 'Webhook configured successfully',
           timestamp: new Date().toISOString()
         },
         timestamp: new Date().toISOString()
-      }, { timeout: 5000 });
+      };
+      
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Platform-Event': 'webhook.test'
+      };
+      
+      // Add signature if apiSecret exists
+      if (user.apiAccess?.apiSecret) {
+        testPayload.signature = crypto
+          .createHmac('sha256', user.apiAccess.apiSecret)
+          .update(JSON.stringify(testPayload.data))
+          .digest('hex');
+        headers['X-Platform-Signature'] = testPayload.signature;
+      }
+      
+      await axios.post(webhook_url, testPayload, { 
+        headers,
+        timeout: 5000 
+      });
       
       return apiResponse.success(res, 'Webhook configured and tested', {
         webhook_url: webhook_url,
-        test_status: 'successful'
+        test_status: 'successful',
+        signature_enabled: !!user.apiAccess?.apiSecret
       });
     } catch (error) {
       return apiResponse.success(res, 'Webhook configured but test failed', {
         webhook_url: webhook_url,
         test_status: 'failed',
-        test_error: error.message
+        test_error: error.message,
+        note: 'Webhook will still work - ensure your endpoint is accessible'
       });
     }
   } catch (error) {
@@ -1049,7 +1080,9 @@ router.post('/v1/webhook/test', async (req, res) => {
     });
     
     return apiResponse.success(res, 'Test webhook sent', {
-      webhook_url: user.apiAccess.webhookUrl
+      webhook_url: user.apiAccess.webhookUrl,
+      signature_enabled: !!user.apiAccess?.apiSecret,
+      note: 'Check your webhook endpoint for the test event'
     });
   } catch (error) {
     console.error('Webhook Test Error:', error);
