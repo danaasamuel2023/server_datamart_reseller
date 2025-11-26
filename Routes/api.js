@@ -1,6 +1,6 @@
 // =============================================
 // EXTERNAL API ROUTES - GHANA MTN DATA PLATFORM
-// COMPLETE - Fixed bulk orders + webhook status updates + OPTIONAL SIGNATURE
+// INTEGRATED WITH DATAMART API - YELLO NETWORK ONLY
 // =============================================
 
 const express = require('express');
@@ -22,6 +22,83 @@ const {
 
 // Import middleware
 const { apiKey, rateLimit } = require('../middleware/middleware');
+
+// =============================================
+// DATAMART API CONFIGURATION
+// =============================================
+const DATAMART_BASE_URL = 'https://api.datamartgh.shop';
+const DATAMART_API_KEY = process.env.DATAMART_API_KEY || 'f9329bb51dd27c41fe3b85c7eb916a8e88821e07fd0565e1ff2558e7be3be7b4';
+
+const datamartClient = axios.create({
+  baseURL: DATAMART_BASE_URL,
+  headers: {
+    'x-api-key': DATAMART_API_KEY,
+    'Content-Type': 'application/json'
+  },
+  timeout: 30000
+});
+
+// Helper to convert capacity to DataMart format (just the number)
+const parseCapacityForDatamart = (capacity) => {
+  const match = capacity.toUpperCase().match(/^(\d+(?:\.\d+)?)(MB|GB)$/i);
+  if (!match) return null;
+  
+  const value = parseFloat(match[1]);
+  const unit = match[2].toUpperCase();
+  
+  // DataMart expects capacity in GB as string number
+  if (unit === 'MB') {
+    return (value / 1000).toString(); // Convert MB to GB
+  }
+  return value.toString(); // Already in GB
+};
+
+// Process order through DataMart API
+const processWithDatamart = async (phoneNumber, capacity, reference) => {
+  try {
+    const datamartCapacity = parseCapacityForDatamart(capacity);
+    
+    if (!datamartCapacity) {
+      return { success: false, error: 'Invalid capacity format' };
+    }
+
+    const payload = {
+      phoneNumber: phoneNumber,
+      network: 'YELLO', // All requests go to YELLO (MTN)
+      capacity: datamartCapacity,
+      gateway: 'wallet',
+      ref: reference
+    };
+
+    console.log('[DATAMART] Sending request:', payload);
+
+    const response = await datamartClient.post('/api/developer/purchase', payload);
+
+    console.log('[DATAMART] Response:', response.data);
+
+    if (response.data && response.data.status === 'success') {
+      return {
+        success: true,
+        purchaseId: response.data.data?.purchaseId,
+        message: response.data.message || 'Success',
+        data: response.data
+      };
+    } else {
+      return {
+        success: false,
+        error: response.data?.message || 'DataMart processing failed',
+        data: response.data
+      };
+    }
+  } catch (error) {
+    console.error('[DATAMART] Error:', error.response?.data || error.message);
+    return {
+      success: false,
+      error: error.response?.data?.message || error.message,
+      data: error.response?.data
+    };
+  }
+};
 
 // Apply API authentication and rate limiting
 router.use(apiKey);
@@ -112,7 +189,6 @@ const sendWebhook = async (user, event, data) => {
       'X-Platform-Event': event
     };
     
-    // Only add signature if apiSecret exists (OPTIONAL)
     if (user.apiAccess.apiSecret) {
       payload.signature = crypto
         .createHmac('sha256', user.apiAccess.apiSecret)
@@ -130,18 +206,6 @@ const sendWebhook = async (user, event, data) => {
     console.log(`✅ Webhook sent: ${event} to ${user.apiAccess.webhookUrl}`);
   } catch (error) {
     console.error('❌ Webhook error:', error.message);
-  }
-};
-
-// Function to send transaction status update
-const sendTransactionStatusWebhook = async (userId, transactionData) => {
-  try {
-    const user = await User.findById(userId).select('apiAccess');
-    if (!user || !user.apiAccess?.webhookUrl) return;
-    
-    await sendWebhook(user, 'transaction.status_update', transactionData);
-  } catch (error) {
-    console.error('Transaction webhook error:', error.message);
   }
 };
 
@@ -249,7 +313,8 @@ router.get('/v1/account', async (req, res) => {
         rateLimit: user.apiAccess.rateLimit || 100,
         webhookUrl: user.apiAccess.webhookUrl,
         webhookSignatureEnabled: !!user.apiAccess.apiSecret
-      }
+      },
+      supported_networks: ['YELLO (MTN)'] // Only YELLO supported
     });
   } catch (error) {
     console.error('Account API Error:', error);
@@ -303,17 +368,10 @@ router.get('/v1/products', async (req, res) => {
         
         let price;
         switch (userRole) {
-          case 'supplier':
-            price = pricing.supplierPrice;
-            break;
-          case 'dealer':
-            price = pricing.dealerPrice;
-            break;
-          case 'agent':
-            price = pricing.agentPrice;
-            break;
-          default:
-            price = pricing.agentPrice;
+          case 'supplier': price = pricing.supplierPrice; break;
+          case 'dealer': price = pricing.dealerPrice; break;
+          case 'agent': price = pricing.agentPrice; break;
+          default: price = pricing.agentPrice;
         }
         
         if (min_capacity || max_capacity) {
@@ -335,6 +393,7 @@ router.get('/v1/products', async (req, res) => {
           validity: `${product.validity.value} ${product.validity.unit}`,
           price: price,
           currency: 'GHS',
+          network: 'YELLO', // All products are YELLO
           status: product.status
         };
       })
@@ -344,7 +403,8 @@ router.get('/v1/products', async (req, res) => {
     
     return apiResponse.success(res, 'Products retrieved', {
       products: validProducts,
-      total: validProducts.length
+      total: validProducts.length,
+      supported_network: 'YELLO (MTN)'
     });
   } catch (error) {
     console.error('Products API Error:', error);
@@ -356,7 +416,7 @@ router.get('/v1/products', async (req, res) => {
 });
 
 // =============================================
-// 3. SINGLE PURCHASE API - WITH WEBHOOK STATUS
+// 3. SINGLE PURCHASE API - DATAMART INTEGRATED
 // =============================================
 
 router.post('/v1/purchase', async (req, res) => {
@@ -396,11 +456,12 @@ router.post('/v1/purchase', async (req, res) => {
       });
     }
     
-    if (!beneficiary_number.match(/^(\+233|0)[235][0-9]{8}$/)) {
+    // Validate Ghana MTN number format
+    if (!beneficiary_number.match(/^(\+233|0)(24|25|53|54|55|59)[0-9]{7}$/)) {
       await session.abortTransaction();
-      return apiResponse.error(res, 'Invalid Ghana phone number', {
+      return apiResponse.error(res, 'Invalid MTN Ghana phone number', {
         code: 'INVALID_PHONE_NUMBER',
-        format: 'Valid format: 0241234567 or +233241234567',
+        format: 'Valid MTN prefixes: 024, 025, 053, 054, 055, 059',
         provided: beneficiary_number
       });
     }
@@ -431,20 +492,13 @@ router.post('/v1/purchase', async (req, res) => {
       });
     }
     
-    // Calculate price
+    // Calculate price based on user role
     let amount;
     switch (req.userRole) {
-      case 'supplier':
-        amount = pricing.supplierPrice;
-        break;
-      case 'dealer':
-        amount = pricing.dealerPrice;
-        break;
-      case 'agent':
-        amount = pricing.agentPrice;
-        break;
-      default:
-        amount = pricing.agentPrice;
+      case 'supplier': amount = pricing.supplierPrice; break;
+      case 'dealer': amount = pricing.dealerPrice; break;
+      case 'agent': amount = pricing.agentPrice; break;
+      default: amount = pricing.agentPrice;
     }
     
     // Check wallet balance
@@ -479,7 +533,7 @@ router.post('/v1/purchase', async (req, res) => {
     user.wallet.balance -= amount;
     await user.save({ session });
     
-    // Create transaction
+    // Create transaction as pending
     const transaction = new Transaction({
       transactionId: transactionRef,
       user: req.userId,
@@ -488,7 +542,7 @@ router.post('/v1/purchase', async (req, res) => {
         product: product._id,
         beneficiaryNumber: beneficiary_number,
         capacity: `${product.capacity.value}${product.capacity.unit}`,
-        network: 'MTN'
+        network: 'YELLO' // Always YELLO
       },
       amount: amount,
       balanceBefore: balanceBefore,
@@ -501,7 +555,8 @@ router.post('/v1/purchase', async (req, res) => {
         apiKey: req.header('X-API-Key'),
         callbackUrl: callback_url,
         requestedCapacity: capacity,
-        requestedProductName: product_name
+        requestedProductName: product_name,
+        processingProvider: 'datamart'
       }
     });
     
@@ -520,50 +575,117 @@ router.post('/v1/purchase', async (req, res) => {
       relatedTransaction: transaction._id
     }], { session });
     
+    // Commit the database transaction first
     await session.commitTransaction();
     
-    // Send webhook with transaction status (signature optional)
-    sendWebhook(user, 'transaction.created', {
-      reference: transactionRef,
-      transaction_id: transaction._id,
-      status: 'pending',
-      product: {
-        name: product.name,
-        capacity: capacity
-      },
-      beneficiary: beneficiary_number,
-      amount: amount,
-      balance_after: user.wallet.balance,
-      created_at: transaction.createdAt
-    });
+    // Now process with DataMart API
+    console.log(`[API] Processing order ${transactionRef} through DataMart...`);
     
-    // Send callback
-    if (callback_url) {
-      axios.post(callback_url, {
+    const datamartResult = await processWithDatamart(
+      beneficiary_number,
+      capacity,
+      transactionRef
+    );
+    
+    if (datamartResult.success) {
+      // Update transaction as completed
+      await Transaction.findByIdAndUpdate(transaction._id, {
+        status: 'completed',
+        completedAt: new Date(),
+        'metadata.datamartPurchaseId': datamartResult.purchaseId,
+        'metadata.datamartResponse': datamartResult.data
+      });
+      
+      // Send success webhook
+      sendWebhook(user, 'transaction.completed', {
         reference: transactionRef,
-        status: 'pending',
-        message: 'Data purchase pending manual processing',
-        transaction_id: transaction._id
-      }).catch(err => console.error('Callback Error:', err));
+        transaction_id: transaction._id,
+        status: 'completed',
+        product: { name: product.name, capacity: capacity },
+        beneficiary: beneficiary_number,
+        amount: amount,
+        balance_after: user.wallet.balance,
+        provider_reference: datamartResult.purchaseId,
+        completed_at: new Date()
+      });
+      
+      // Send callback
+      if (callback_url) {
+        axios.post(callback_url, {
+          reference: transactionRef,
+          status: 'completed',
+          message: 'Data purchase completed successfully',
+          transaction_id: transaction._id,
+          provider_reference: datamartResult.purchaseId
+        }).catch(err => console.error('Callback Error:', err));
+      }
+      
+      return apiResponse.success(res, 'Purchase completed successfully', {
+        reference: transactionRef,
+        transaction_id: transaction._id,
+        product: {
+          name: product.name,
+          capacity: capacity,
+          validity: `${product.validity.value} ${product.validity.unit}`,
+          product_code: product.productCode
+        },
+        network: 'YELLO',
+        beneficiary: beneficiary_number,
+        amount: amount,
+        price_tier: req.userRole,
+        currency: 'GHS',
+        status: 'completed',
+        provider_reference: datamartResult.purchaseId,
+        balance_after: user.wallet.balance,
+        webhook_sent: !!user.apiAccess?.webhookUrl
+      }, 201);
+      
+    } else {
+      // DataMart failed - refund user
+      console.error(`[API] DataMart failed for ${transactionRef}:`, datamartResult.error);
+      
+      await User.findByIdAndUpdate(req.userId, {
+        $inc: { 'wallet.balance': amount }
+      });
+      
+      // Update transaction as failed
+      await Transaction.findByIdAndUpdate(transaction._id, {
+        status: 'failed',
+        failureReason: datamartResult.error,
+        'metadata.datamartError': datamartResult.data
+      });
+      
+      // Create refund wallet transaction
+      await WalletTransaction.create({
+        user: req.userId,
+        type: 'credit',
+        amount: amount,
+        balanceBefore: user.wallet.balance,
+        balanceAfter: user.wallet.balance + amount,
+        purpose: 'refund',
+        reference: transactionRef + '_REFUND',
+        status: 'completed',
+        description: `Refund for failed order: ${datamartResult.error}`
+      });
+      
+      // Send failure webhook
+      sendWebhook(user, 'transaction.failed', {
+        reference: transactionRef,
+        transaction_id: transaction._id,
+        status: 'failed',
+        error: datamartResult.error,
+        amount_refunded: amount,
+        balance_after: user.wallet.balance + amount
+      });
+      
+      return apiResponse.error(res, 'Purchase failed - amount refunded', {
+        code: 'PROVIDER_ERROR',
+        reference: transactionRef,
+        error: datamartResult.error,
+        amount_refunded: amount,
+        balance_after: user.wallet.balance + amount
+      }, 500);
     }
-    
-    return apiResponse.success(res, 'Purchase successful - pending manual processing', {
-      reference: transactionRef,
-      transaction_id: transaction._id,
-      product: {
-        name: product.name,
-        capacity: capacity,
-        validity: `${product.validity.value} ${product.validity.unit}`,
-        product_code: product.productCode
-      },
-      beneficiary: beneficiary_number,
-      amount: amount,
-      price_tier: req.userRole,
-      currency: 'GHS',
-      status: 'pending',
-      balance_after: user.wallet.balance,
-      webhook_sent: !!user.apiAccess?.webhookUrl
-    }, 201);
     
   } catch (error) {
     await session.abortTransaction();
@@ -578,7 +700,7 @@ router.post('/v1/purchase', async (req, res) => {
 });
 
 // =============================================
-// 4. BULK PURCHASE API - FIXED + WEBHOOK STATUS
+// 4. BULK PURCHASE API - DATAMART INTEGRATED
 // =============================================
 
 router.post('/v1/purchase/bulk', async (req, res) => {
@@ -605,19 +727,21 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       });
     }
     
-    // Validate all orders
+    // Validate all orders first
     const validatedOrders = [];
     let totalAmount = 0;
     
     for (let i = 0; i < orders.length; i++) {
       const order = orders[i];
       
-      if (!order.beneficiary_number?.match(/^(\+233|0)[235][0-9]{8}$/)) {
+      // Validate MTN number
+      if (!order.beneficiary_number?.match(/^(\+233|0)(24|25|53|54|55|59)[0-9]{7}$/)) {
         await session.abortTransaction();
-        return apiResponse.error(res, `Invalid phone number in order ${i + 1}`, {
+        return apiResponse.error(res, `Invalid MTN phone number in order ${i + 1}`, {
           code: 'INVALID_PHONE_NUMBER',
           order_index: i,
-          beneficiary: order.beneficiary_number
+          beneficiary: order.beneficiary_number,
+          valid_prefixes: '024, 025, 053, 054, 055, 059'
         });
       }
       
@@ -666,17 +790,10 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       
       let unitPrice;
       switch (req.userRole) {
-        case 'supplier':
-          unitPrice = pricing.supplierPrice;
-          break;
-        case 'dealer':
-          unitPrice = pricing.dealerPrice;
-          break;
-        case 'agent':
-          unitPrice = pricing.agentPrice;
-          break;
-        default:
-          unitPrice = pricing.agentPrice;
+        case 'supplier': unitPrice = pricing.supplierPrice; break;
+        case 'dealer': unitPrice = pricing.dealerPrice; break;
+        case 'agent': unitPrice = pricing.agentPrice; break;
+        default: unitPrice = pricing.agentPrice;
       }
       
       const quantity = order.quantity || 1;
@@ -695,11 +812,11 @@ router.post('/v1/purchase/bulk', async (req, res) => {
       });
     }
     
-    // Check wallet balance
+    // Check wallet balance for total
     const user = await User.findById(req.userId).session(session);
     if (user.wallet.balance < totalAmount) {
       await session.abortTransaction();
-      return apiResponse.error(res, 'Insufficient wallet balance', {
+      return apiResponse.error(res, 'Insufficient wallet balance for bulk order', {
         code: 'INSUFFICIENT_BALANCE',
         required_amount: totalAmount,
         current_balance: user.wallet.balance,
@@ -711,156 +828,182 @@ router.post('/v1/purchase/bulk', async (req, res) => {
     const bulkReference = reference || 'BULK_API' + Date.now() + crypto.randomBytes(4).toString('hex').toUpperCase();
     const balanceBefore = user.wallet.balance;
     
-    const processedOrders = [];
-    const failedOrders = [];
-    let actualAmountCharged = 0;
+    // Deduct total amount upfront
+    user.wallet.balance -= totalAmount;
+    await user.save({ session });
     
-    // Process each order
+    // Create all transactions
+    const createdTransactions = [];
     for (const orderDetail of validatedOrders) {
       const orderRef = orderDetail.reference || 
                       'API' + Date.now() + crypto.randomBytes(4).toString('hex').toUpperCase();
       
-      try {
-        const transaction = new Transaction({
-          transactionId: orderRef,
-          user: req.userId,
-          type: 'data_purchase',
-          dataDetails: {
-            product: orderDetail.product._id,
-            beneficiaryNumber: orderDetail.beneficiaryNumber,
-            capacity: `${orderDetail.product.capacity.value}${orderDetail.product.capacity.unit}`,
-            network: 'MTN',
-            quantity: orderDetail.quantity
-          },
-          amount: orderDetail.amount,
-          status: 'pending',
-          reference: orderRef,
-          paymentMethod: 'wallet',
-          channel: 'api',
-          metadata: {
-            bulkReference: bulkReference,
-            apiKey: req.header('X-API-Key'),
-            requestedCapacity: orderDetail.requestedCapacity,
-            requestedProductName: orderDetail.requestedProductName
-          }
+      const transaction = new Transaction({
+        transactionId: orderRef,
+        user: req.userId,
+        type: 'data_purchase',
+        dataDetails: {
+          product: orderDetail.product._id,
+          beneficiaryNumber: orderDetail.beneficiaryNumber,
+          capacity: `${orderDetail.product.capacity.value}${orderDetail.product.capacity.unit}`,
+          network: 'YELLO',
+          quantity: orderDetail.quantity
+        },
+        amount: orderDetail.amount,
+        status: 'pending',
+        reference: orderRef,
+        paymentMethod: 'wallet',
+        channel: 'api',
+        metadata: {
+          bulkReference: bulkReference,
+          apiKey: req.header('X-API-Key'),
+          requestedCapacity: orderDetail.requestedCapacity,
+          requestedProductName: orderDetail.requestedProductName,
+          processingProvider: 'datamart'
+        }
+      });
+      
+      await transaction.save({ session });
+      createdTransactions.push({ transaction, orderDetail, orderRef });
+    }
+    
+    // Create wallet transaction for bulk
+    await WalletTransaction.create([{
+      user: req.userId,
+      type: 'debit',
+      amount: totalAmount,
+      balanceBefore: balanceBefore,
+      balanceAfter: user.wallet.balance,
+      purpose: 'purchase',
+      reference: bulkReference,
+      status: 'completed',
+      description: `Bulk API: ${validatedOrders.length} orders`
+    }], { session });
+    
+    // Commit database transaction
+    await session.commitTransaction();
+    
+    // Now process each order with DataMart
+    const processedOrders = [];
+    const failedOrders = [];
+    let totalRefund = 0;
+    
+    for (const { transaction, orderDetail, orderRef } of createdTransactions) {
+      const datamartResult = await processWithDatamart(
+        orderDetail.beneficiaryNumber,
+        orderDetail.requestedCapacity,
+        orderRef
+      );
+      
+      if (datamartResult.success) {
+        await Transaction.findByIdAndUpdate(transaction._id, {
+          status: 'completed',
+          completedAt: new Date(),
+          'metadata.datamartPurchaseId': datamartResult.purchaseId
         });
         
-        await transaction.save({ session });
+        processedOrders.push({
+          reference: orderRef,
+          transaction_id: transaction._id,
+          product_name: orderDetail.product.name,
+          capacity: orderDetail.requestedCapacity,
+          beneficiary: orderDetail.beneficiaryNumber,
+          quantity: orderDetail.quantity,
+          amount: orderDetail.amount,
+          status: 'completed',
+          provider_reference: datamartResult.purchaseId
+        });
+      } else {
+        await Transaction.findByIdAndUpdate(transaction._id, {
+          status: 'failed',
+          failureReason: datamartResult.error
+        });
         
-        // TODO: Call MTN API
-        const mtnSuccess = true;
+        totalRefund += orderDetail.amount;
         
-        if (mtnSuccess) {
-          if (orderDetail.product.stats) {
-            orderDetail.product.stats.totalSold = (orderDetail.product.stats.totalSold || 0) + orderDetail.quantity;
-            orderDetail.product.stats.totalRevenue = (orderDetail.product.stats.totalRevenue || 0) + orderDetail.amount;
-            await orderDetail.product.save({ session });
-          }
-          
-          actualAmountCharged += orderDetail.amount;
-          
-          processedOrders.push({
-            reference: orderRef,
-            transaction_id: transaction._id,
-            product_name: orderDetail.product.name,
-            capacity: orderDetail.requestedCapacity,
-            beneficiary: orderDetail.beneficiaryNumber,
-            quantity: orderDetail.quantity,
-            amount: orderDetail.amount,
-            status: 'pending'
-          });
-        } else {
-          throw new Error('MTN processing failed');
-        }
-        
-      } catch (error) {
         failedOrders.push({
+          reference: orderRef,
           product_name: orderDetail.requestedProductName,
           capacity: orderDetail.requestedCapacity,
           beneficiary: orderDetail.beneficiaryNumber,
           amount: orderDetail.amount,
-          error: error.message,
+          error: datamartResult.error,
           status: 'failed'
         });
       }
+      
+      // Small delay between orders to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
     
-    // Only deduct for successful orders
-    if (actualAmountCharged > 0) {
-      user.wallet.balance -= actualAmountCharged;
-      await user.save({ session });
-      
-      await WalletTransaction.create([{
-        user: req.userId,
-        type: 'debit',
-        amount: actualAmountCharged,
-        balanceBefore: balanceBefore,
-        balanceAfter: user.wallet.balance,
-        purpose: 'purchase',
-        reference: bulkReference,
-        status: 'completed',
-        description: `Bulk API: ${processedOrders.length} success, ${failedOrders.length} failed`
-      }], { session });
-    }
-    
-    // Only commit if at least one succeeded
-    if (processedOrders.length > 0) {
-      await session.commitTransaction();
-      
-      // Send webhook with detailed status (signature optional)
-      sendWebhook(user, 'bulk_purchase.completed', {
-        bulk_reference: bulkReference,
-        status: 'completed',
-        summary: {
-          total_orders: orders.length,
-          successful_count: processedOrders.length,
-          failed_count: failedOrders.length,
-          total_requested_amount: totalAmount,
-          amount_charged: actualAmountCharged,
-          amount_saved: totalAmount - actualAmountCharged
-        },
-        successful_orders: processedOrders,
-        failed_orders: failedOrders,
-        balance_after: user.wallet.balance,
-        created_at: new Date()
+    // Refund failed orders
+    if (totalRefund > 0) {
+      await User.findByIdAndUpdate(req.userId, {
+        $inc: { 'wallet.balance': totalRefund }
       });
       
-      if (callback_url) {
-        axios.post(callback_url, {
-          reference: bulkReference,
-          status: 'completed',
-          summary: {
-            total: orders.length,
-            successful: processedOrders.length,
-            failed: failedOrders.length,
-            amount_charged: actualAmountCharged
-          }
-        }).catch(err => console.error('Callback Error:', err));
-      }
-      
-      return apiResponse.success(res, 'Bulk purchase processed', {
-        bulk_reference: bulkReference,
-        summary: {
-          total_orders: orders.length,
-          successful_count: processedOrders.length,
-          failed_count: failedOrders.length,
-          total_requested: totalAmount,
-          amount_charged: actualAmountCharged,
-          amount_saved: totalAmount - actualAmountCharged
-        },
-        successful_orders: processedOrders,
-        failed_orders: failedOrders,
-        balance_after: user.wallet.balance,
-        webhook_sent: !!user.apiAccess?.webhookUrl
-      }, 201);
-    } else {
-      await session.abortTransaction();
-      return apiResponse.error(res, 'All orders failed to process', {
-        code: 'ALL_ORDERS_FAILED',
-        failed_orders: failedOrders,
-        balance_unchanged: balanceBefore
-      }, 400);
+      await WalletTransaction.create({
+        user: req.userId,
+        type: 'credit',
+        amount: totalRefund,
+        balanceBefore: user.wallet.balance,
+        balanceAfter: user.wallet.balance + totalRefund,
+        purpose: 'refund',
+        reference: bulkReference + '_REFUND',
+        status: 'completed',
+        description: `Refund for ${failedOrders.length} failed orders in bulk ${bulkReference}`
+      });
     }
+    
+    const finalBalance = user.wallet.balance + totalRefund;
+    
+    // Send webhook
+    sendWebhook(user, 'bulk_purchase.completed', {
+      bulk_reference: bulkReference,
+      status: 'completed',
+      summary: {
+        total_orders: orders.length,
+        successful_count: processedOrders.length,
+        failed_count: failedOrders.length,
+        total_requested_amount: totalAmount,
+        amount_charged: totalAmount - totalRefund,
+        amount_refunded: totalRefund
+      },
+      successful_orders: processedOrders,
+      failed_orders: failedOrders,
+      balance_after: finalBalance
+    });
+    
+    if (callback_url) {
+      axios.post(callback_url, {
+        reference: bulkReference,
+        status: 'completed',
+        summary: {
+          total: orders.length,
+          successful: processedOrders.length,
+          failed: failedOrders.length,
+          amount_charged: totalAmount - totalRefund,
+          amount_refunded: totalRefund
+        }
+      }).catch(err => console.error('Callback Error:', err));
+    }
+    
+    return apiResponse.success(res, 'Bulk purchase processed', {
+      bulk_reference: bulkReference,
+      network: 'YELLO',
+      summary: {
+        total_orders: orders.length,
+        successful_count: processedOrders.length,
+        failed_count: failedOrders.length,
+        total_requested: totalAmount,
+        amount_charged: totalAmount - totalRefund,
+        amount_refunded: totalRefund
+      },
+      successful_orders: processedOrders,
+      failed_orders: failedOrders,
+      balance_after: finalBalance,
+      webhook_sent: !!user.apiAccess?.webhookUrl
+    }, 201);
     
   } catch (error) {
     await session.abortTransaction();
@@ -903,6 +1046,7 @@ router.get('/v1/transactions/:reference', async (req, res) => {
       reference: transaction.reference,
       transaction_id: transaction._id,
       status: transaction.status,
+      network: 'YELLO',
       product: {
         name: transaction.dataDetails.product?.name,
         capacity: transaction.dataDetails.capacity
@@ -910,6 +1054,7 @@ router.get('/v1/transactions/:reference', async (req, res) => {
       beneficiary: transaction.dataDetails.beneficiaryNumber,
       amount: transaction.amount,
       currency: 'GHS',
+      provider_reference: transaction.metadata?.datamartPurchaseId,
       created_at: transaction.createdAt,
       completed_at: transaction.completedAt,
       failure_reason: transaction.failureReason
@@ -925,18 +1070,9 @@ router.get('/v1/transactions/:reference', async (req, res) => {
 
 router.get('/v1/transactions', async (req, res) => {
   try {
-    const { 
-      status, 
-      start_date, 
-      end_date, 
-      page = 1, 
-      limit = 20 
-    } = req.query;
+    const { status, start_date, end_date, page = 1, limit = 20 } = req.query;
     
-    const filter = {
-      user: req.userId,
-      channel: 'api'
-    };
+    const filter = { user: req.userId, channel: 'api' };
     
     if (status) filter.status = status;
     if (start_date || end_date) {
@@ -959,9 +1095,11 @@ router.get('/v1/transactions', async (req, res) => {
       transaction_id: tx._id,
       product_name: tx.dataDetails.product?.name,
       capacity: tx.metadata?.requestedCapacity || tx.dataDetails.capacity,
+      network: 'YELLO',
       beneficiary: tx.dataDetails.beneficiaryNumber,
       amount: tx.amount,
       status: tx.status,
+      provider_reference: tx.metadata?.datamartPurchaseId,
       created_at: tx.createdAt,
       completed_at: tx.completedAt
     }));
@@ -1018,6 +1156,7 @@ router.put('/v1/webhook', async (req, res) => {
         event: 'webhook.test',
         data: {
           message: 'Webhook configured successfully',
+          supported_network: 'YELLO (MTN)',
           timestamp: new Date().toISOString()
         },
         timestamp: new Date().toISOString()
@@ -1028,7 +1167,6 @@ router.put('/v1/webhook', async (req, res) => {
         'X-Platform-Event': 'webhook.test'
       };
       
-      // Add signature if apiSecret exists
       if (user.apiAccess?.apiSecret) {
         testPayload.signature = crypto
           .createHmac('sha256', user.apiAccess.apiSecret)
@@ -1037,10 +1175,7 @@ router.put('/v1/webhook', async (req, res) => {
         headers['X-Platform-Signature'] = testPayload.signature;
       }
       
-      await axios.post(webhook_url, testPayload, { 
-        headers,
-        timeout: 5000 
-      });
+      await axios.post(webhook_url, testPayload, { headers, timeout: 5000 });
       
       return apiResponse.success(res, 'Webhook configured and tested', {
         webhook_url: webhook_url,
@@ -1076,6 +1211,7 @@ router.post('/v1/webhook/test', async (req, res) => {
     
     await sendWebhook(user, 'webhook.test', {
       message: 'This is a test webhook',
+      supported_network: 'YELLO (MTN)',
       timestamp: new Date().toISOString()
     });
     
@@ -1103,17 +1239,10 @@ router.get('/v1/statistics', async (req, res) => {
     
     let startDate;
     switch (period) {
-      case '24hours':
-        startDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
-        break;
-      case '7days':
-        startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case '30days':
-        startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      case '24hours': startDate = new Date(Date.now() - 24 * 60 * 60 * 1000); break;
+      case '7days': startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); break;
+      case '30days': startDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); break;
+      default: startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     }
     
     const apiStats = await ApiLog.aggregate([
@@ -1127,12 +1256,8 @@ router.get('/v1/statistics', async (req, res) => {
         $group: {
           _id: null,
           total_requests: { $sum: 1 },
-          successful_requests: {
-            $sum: { $cond: [{ $eq: ['$success', true] }, 1, 0] }
-          },
-          failed_requests: {
-            $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] }
-          },
+          successful_requests: { $sum: { $cond: [{ $eq: ['$success', true] }, 1, 0] } },
+          failed_requests: { $sum: { $cond: [{ $eq: ['$success', false] }, 1, 0] } },
           avg_response_time: { $avg: '$response.responseTime' }
         }
       }
@@ -1163,11 +1288,12 @@ router.get('/v1/statistics', async (req, res) => {
         avg_response_time: 0
       },
       transactions: {
-        successful: 0,
+        completed: 0,
         failed: 0,
         pending: 0,
         total_amount: 0
-      }
+      },
+      supported_network: 'YELLO (MTN)'
     };
     
     transactionStats.forEach(stat => {
@@ -1197,6 +1323,7 @@ router.use((req, res) => {
     code: 'ENDPOINT_NOT_FOUND',
     endpoint: req.originalUrl,
     method: req.method,
+    supported_network: 'YELLO (MTN)',
     available_endpoints: [
       'GET /v1/account',
       'GET /v1/balance',
@@ -1220,4 +1347,4 @@ router.use((error, req, res, next) => {
   }, 500);
 });
 
-module.exports = router;
+module.exports = router; 
